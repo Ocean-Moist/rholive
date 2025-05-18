@@ -1,3 +1,9 @@
+//! Audio capture module
+//!
+//! Provides functionality to capture audio from system sources using PulseAudio.
+//! The captured audio is in 16-bit little-endian PCM format at 16 kHz, which is
+//! compatible with the Gemini Live API requirements.
+
 use libpulse_simple_binding::Simple;
 use libpulse_binding::stream::Direction;
 use libpulse_binding::sample::{Spec, Format};

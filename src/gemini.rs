@@ -1,12 +1,18 @@
-// Gemini Live API client wrapper
-// Based on IMPLEMENTATION_PLAN.md and GEMINI_LIVE_API.md
-// Provides minimal structures and async WebSocket client for interacting with the API.
+//! Gemini Live API module
+//! 
+//! Provides a client for interacting with Google's Gemini Live API via WebSockets.
+//! Handles audio, video, and text streaming with the model.
 
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_tungstenite::tungstenite::Error as WsError;
-use std::io;
+use std::time::Duration;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 use futures_util::{StreamExt, SinkExt};
+use tracing::{debug, error, info};
+use base64::engine::general_purpose;
+use base64::Engine;
 
 #[cfg(test)]
 mod tests {
@@ -151,7 +157,7 @@ mod tests {
         
         let url = format!("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={}", api_key);
         
-        let client_result = GeminiClient::connect(&url).await;
+        let client_result = GeminiClient::new(GeminiClientConfig { url, model: "models/gemini-2.0-flash-live-001".to_string() , response_modality: ResponseModality::Text, system_instruction: Option::from("".to_string()), temperature: Some(1.0), media_resolution: None, reconnect_attempts: 0, reconnect_delay: Default::default() }).connect().await;
         assert!(client_result.is_ok(), "Failed to connect to Gemini API: {:?}", client_result.err());
         
         let mut client = client_result.unwrap();
@@ -322,91 +328,602 @@ pub enum ServerMessage {
     },
 }
 
-/// Async Gemini Live API client.
+/// Error type for Gemini API operations
+#[derive(Debug, thiserror::Error)]
+pub enum GeminiError {
+    #[error("WebSocket error: {0}")]
+    WebSocket(#[from] WsError),
+    
+    #[error("JSON serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("Connection closed")]
+    ConnectionClosed,
+    
+    #[error("Setup not complete")]
+    SetupNotComplete,
+    
+    #[error("Channel closed")]
+    ChannelClosed,
+    
+    #[error("Timeout")]
+    Timeout,
+    
+    #[error("Other error: {0}")]
+    Other(String),
+}
+
+pub type Result<T> = std::result::Result<T, GeminiError>;
+
+/// Transcript from the Gemini API
+#[derive(Debug, Clone)]
+pub struct Transcript {
+    pub text: String,
+    pub is_final: bool,
+}
+
+/// Response from the Gemini API
+#[derive(Debug, Clone)]
+pub enum ApiResponse {
+    /// Setup has been completed
+    SetupComplete,
+    
+    /// Transcription of user input
+    InputTranscription(Transcript),
+    
+    /// Transcription of model output (if using TTS)
+    OutputTranscription(Transcript),
+    
+    /// Text response from the model
+    TextResponse {
+        text: String,
+        is_complete: bool,
+    },
+    
+    /// Audio response from the model
+    AudioResponse {
+        data: Vec<u8>,
+        is_complete: bool,
+    },
+    
+    /// Model is requesting a tool call
+    ToolCall(serde_json::Value),
+    
+    /// Model has cancelled a tool call
+    ToolCallCancellation(String),
+    
+    /// Server will disconnect soon
+    GoAway,
+    
+    /// Session resumption token provided
+    SessionResumptionUpdate(String),
+}
+
+/// Configuration for the Gemini client
+#[derive(Debug, Clone)]
+pub struct GeminiClientConfig {
+    pub url: String,
+    pub model: String,
+    pub response_modality: ResponseModality,
+    pub system_instruction: Option<String>,
+    pub temperature: Option<f32>,
+    pub media_resolution: Option<MediaResolution>,
+    pub reconnect_attempts: usize,
+    pub reconnect_delay: Duration,
+}
+
+impl Default for GeminiClientConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            model: "models/gemini-2.0-flash-live-001".to_string(),
+            response_modality: ResponseModality::Text,
+            system_instruction: None,
+            temperature: Some(0.7),
+            media_resolution: Some(MediaResolution::Medium),
+            reconnect_attempts: 3,
+            reconnect_delay: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Response modality options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseModality {
+    Text,
+    Audio,
+}
+
+impl ResponseModality {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Text => "TEXT",
+            Self::Audio => "AUDIO",
+        }
+    }
+}
+
+/// Media resolution options for video input
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaResolution {
+    Low,
+    Medium,
+    High,
+}
+
+impl MediaResolution {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "MEDIA_RESOLUTION_LOW",
+            Self::Medium => "MEDIA_RESOLUTION_MEDIUM",
+            Self::High => "MEDIA_RESOLUTION_HIGH",
+        }
+    }
+}
+
+/// Connection state of the Gemini client
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    SetupComplete,
+}
+
+/// Async Gemini Live API client with streaming support.
 pub struct GeminiClient {
-    ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, 
+    config: GeminiClientConfig,
+    ws: Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+    state: ConnectionState,
+    session_token: Option<String>,
+    response_tx: mpsc::Sender<Result<ApiResponse>>,
+    response_rx: mpsc::Receiver<Result<ApiResponse>>,
 }
 
 impl GeminiClient {
-    /// Connect to the Live API endpoint using the given url (should include api key query param).
-    pub async fn connect(url: &str) -> Result<Self, WsError> {
-        let (ws, _resp) = connect_async(url).await?;
-        Ok(GeminiClient { ws })
+    /// Create a new Gemini client with the given configuration.
+    pub fn new(config: GeminiClientConfig) -> Self {
+        let (response_tx, response_rx) = mpsc::channel(100);
+        
+        Self {
+            config,
+            ws: None,
+            state: ConnectionState::Disconnected,
+            session_token: None,
+            response_tx,
+            response_rx,
+        }
     }
-
+    
+    /// Create a new Gemini client from an API key and optional configuration.
+    pub fn from_api_key(api_key: &str, config: Option<GeminiClientConfig>) -> Self {
+        let mut config = config.unwrap_or_default();
+        config.url = format!(
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={}",
+            api_key
+        );
+        Self::new(config)
+    }
+    
+    /// Connect to the Live API endpoint and set up the session.
+    pub async fn connect_and_setup(&mut self) -> Result<()> {
+        self.connect().await?;
+        self.setup().await
+    }
+    
+    /// Connect to the Live API endpoint.
+    pub async fn connect(&mut self) -> Result<()> {
+        if self.state != ConnectionState::Disconnected {
+            return Ok(());
+        }
+        
+        self.state = ConnectionState::Connecting;
+        info!("Connecting to Gemini API at {}", self.config.url);
+        
+        let (ws, _resp) = connect_async(&self.config.url).await
+            .map_err(GeminiError::WebSocket)?;
+        
+        self.ws = Some(ws);
+        self.state = ConnectionState::Connected;
+        info!("Connected to Gemini API");
+        
+        // Start the message processing loop
+        self.start_message_processing();
+        
+        Ok(())
+    }
+    
+    /// Initialize a session by sending the setup message.
+    pub async fn setup(&mut self) -> Result<()> {
+        if self.state == ConnectionState::Disconnected {
+            return Err(GeminiError::ConnectionClosed);
+        }
+        
+        if self.state == ConnectionState::SetupComplete {
+            return Ok(());
+        }
+        
+        info!("Setting up Gemini session");
+        
+        // Create the setup message
+        let mut setup = BidiGenerateContentSetup {
+            model: self.config.model.clone(),
+            system_instruction: self.config.system_instruction.clone(),
+            ..Default::default()
+        };
+        
+        // Set up generation config
+        let mut generation_config = GenerationConfig {
+            response_modalities: vec![self.config.response_modality.as_str().to_string()],
+            temperature: self.config.temperature,
+            ..Default::default()
+        };
+        
+        // Add media resolution if specified
+        if let Some(resolution) = self.config.media_resolution {
+            generation_config.media_resolution = Some(resolution.as_str().to_string());
+        }
+        
+        setup.generation_config = Some(generation_config);
+        
+        // Set resumption token if we have one
+        if let Some(token) = &self.session_token {
+            setup.realtime_input_config = Some(serde_json::json!({
+                "sessionResumptionConfig": {
+                    "handle": token
+                }
+            }));
+        }
+        
+        // Send the setup message
+        let msg = ClientMessage::Setup { setup };
+        self.send(&msg).await?;
+        
+        // Wait for setup complete response
+        let timeout = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.wait_for_setup_complete()
+        ).await.map_err(|_| GeminiError::Timeout)?;
+        
+        if timeout {
+            self.state = ConnectionState::SetupComplete;
+            info!("Gemini session setup complete");
+            Ok(())
+        } else {
+            error!("Failed to complete Gemini session setup");
+            Err(GeminiError::SetupNotComplete)
+        }
+    }
+    
+    /// Wait for the setup complete message.
+    async fn wait_for_setup_complete(&mut self) -> bool {
+        let mut attempts = 0;
+        while attempts < 10 {
+            match self.response_rx.recv().await {
+                Some(Ok(ApiResponse::SetupComplete)) => {
+                    return true;
+                }
+                Some(_) => {
+                    // Ignore other messages
+                    attempts += 1;
+                    continue;
+                }
+                None => {
+                    return false;
+                }
+            }
+        }
+        false
+    }
+    
+    /// Start the message processing loop in a background task.
+    fn start_message_processing(&mut self) {
+        if let Some(ws) = self.ws.take() {
+            let ws = Arc::new(Mutex::new(ws));
+            let response_tx = self.response_tx.clone();
+            
+            tokio::spawn(async move {
+                Self::process_messages(ws, response_tx).await;
+            });
+        }
+    }
+    
+    /// Process incoming messages from the WebSocket.
+    async fn process_messages(
+        ws: Arc<Mutex<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>,
+        response_tx: mpsc::Sender<Result<ApiResponse>>,
+    ) {
+        loop {
+            let message = {
+                let mut ws_guard = ws.lock().await;
+                match ws_guard.next().await {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(e)) => {
+                        if let Err(_) = response_tx.send(Err(GeminiError::WebSocket(e))).await {
+                            error!("Failed to send error to response channel");
+                        }
+                        break;
+                    }
+                    None => {
+                        if let Err(_) = response_tx.send(Err(GeminiError::ConnectionClosed)).await {
+                            error!("Failed to send connection closed error");
+                        }
+                        break;
+                    }
+                }
+            };
+            
+            match message {
+                Message::Text(text) => {
+                    debug!("Received text message: {}", text);
+                    if let Err(e) = Self::handle_text_message(&text, &response_tx).await {
+                        error!("Error handling text message: {:?}", e);
+                    }
+                }
+                Message::Binary(bytes) => {
+                    debug!("Received binary message ({} bytes)", bytes.len());
+                    // Could be audio data or other binary content
+                    // Handle based on context
+                }
+                Message::Close(frame) => {
+                    info!("WebSocket closed: {:?}", frame);
+                    if let Err(_) = response_tx.send(Err(GeminiError::ConnectionClosed)).await {
+                        error!("Failed to send connection closed notification");
+                    }
+                    break;
+                }
+                _ => {
+                    // Ignore other message types
+                }
+            }
+        }
+    }
+    
+    /// Handle a text message from the WebSocket.
+    async fn handle_text_message(text: &str, response_tx: &mpsc::Sender<Result<ApiResponse>>) -> Result<()> {
+        let server_message = serde_json::from_str::<ServerMessage>(text)
+            .map_err(GeminiError::Serialization)?;
+            
+        match server_message {
+            ServerMessage::SetupComplete { .. } => {
+                response_tx.send(Ok(ApiResponse::SetupComplete)).await
+                    .map_err(|_| GeminiError::ChannelClosed)?;
+            }
+            ServerMessage::ServerContent { server_content } => {
+                Self::handle_server_content(server_content, response_tx).await?;
+            }
+            ServerMessage::ToolCall { tool_call } => {
+                response_tx.send(Ok(ApiResponse::ToolCall(tool_call))).await
+                    .map_err(|_| GeminiError::ChannelClosed)?;
+            }
+            ServerMessage::ToolCallCancellation { tool_call_cancellation } => {
+                let id = tool_call_cancellation["id"].as_str()
+                    .unwrap_or("unknown")
+                    .to_string();
+                response_tx.send(Ok(ApiResponse::ToolCallCancellation(id))).await
+                    .map_err(|_| GeminiError::ChannelClosed)?;
+            }
+            ServerMessage::GoAway { .. } => {
+                response_tx.send(Ok(ApiResponse::GoAway)).await
+                    .map_err(|_| GeminiError::ChannelClosed)?;
+            }
+            ServerMessage::SessionResumptionUpdate { session_resumption_update } => {
+                let handle = session_resumption_update["newHandle"].as_str()
+                    .unwrap_or("")
+                    .to_string();
+                response_tx.send(Ok(ApiResponse::SessionResumptionUpdate(handle))).await
+                    .map_err(|_| GeminiError::ChannelClosed)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle server content messages which can contain different types of data.
+    async fn handle_server_content(
+        content: serde_json::Value, 
+        response_tx: &mpsc::Sender<Result<ApiResponse>>
+    ) -> Result<()> {
+        // Check for input transcription (from audio we sent)
+        if let Some(input_transcription) = content.get("inputTranscription") {
+            if let Some(text) = input_transcription.get("text").and_then(|t| t.as_str()) {
+                let is_final = input_transcription.get("isFinal")
+                    .and_then(|f| f.as_bool())
+                    .unwrap_or(false);
+                
+                response_tx.send(Ok(ApiResponse::InputTranscription(Transcript {
+                    text: text.to_string(),
+                    is_final,
+                }))).await.map_err(|_| GeminiError::ChannelClosed)?;
+            }
+        }
+        
+        // Check for output transcription (text of model's speech)
+        if let Some(output_transcription) = content.get("outputTranscription") {
+            if let Some(text) = output_transcription.get("text").and_then(|t| t.as_str()) {
+                let is_final = output_transcription.get("isFinal")
+                    .and_then(|f| f.as_bool())
+                    .unwrap_or(false);
+                
+                response_tx.send(Ok(ApiResponse::OutputTranscription(Transcript {
+                    text: text.to_string(),
+                    is_final,
+                }))).await.map_err(|_| GeminiError::ChannelClosed)?;
+            }
+        }
+        
+        // Check for model turn (the actual response)
+        if let Some(model_turn) = content.get("modelTurn") {
+            // For text response
+            if let Some(parts) = model_turn.get("parts").and_then(|p| p.as_array()) {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        let is_complete = content.get("generationComplete")
+                            .and_then(|g| g.as_bool())
+                            .unwrap_or(false);
+                        
+                        response_tx.send(Ok(ApiResponse::TextResponse {
+                            text: text.to_string(),
+                            is_complete,
+                        })).await.map_err(|_| GeminiError::ChannelClosed)?;
+                    } else if let Some(inline_data) = part.get("inlineData") {
+                        // Audio response
+                        if let Some(data_str) = inline_data.get("data").and_then(|d| d.as_str()) {
+                            if let Ok(data) = general_purpose::STANDARD.decode(data_str) {
+                                let is_complete = content.get("generationComplete")
+                                    .and_then(|g| g.as_bool())
+                                    .unwrap_or(false);
+                                
+                                response_tx.send(Ok(ApiResponse::AudioResponse {
+                                    data,
+                                    is_complete,
+                                })).await.map_err(|_| GeminiError::ChannelClosed)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
     /// Send a client message to the server.
-    pub async fn send(&mut self, msg: &ClientMessage) -> Result<(), WsError> {
+    pub async fn send(&mut self, msg: &ClientMessage) -> Result<()> {
         let json = match msg {
             ClientMessage::Setup { setup } => {
                 // Format the JSON manually to avoid nesting issues
                 let setup_json = serde_json::to_string(setup)
-                    .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+                    .map_err(GeminiError::Serialization)?;
                 // Remove outer braces and wrap in setup: {...}
                 let inner = &setup_json[1..setup_json.len()-1];
                 format!("{{\"setup\":{{{}}}}}", inner)
             },
             ClientMessage::ClientContent { client_content } => {
-                format!("{{\"clientContent\":{}}}", serde_json::to_string(client_content)
-                    .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)))?)
+                format!("{{\"clientContent\":{}}}", 
+                    serde_json::to_string(client_content).map_err(GeminiError::Serialization)?)
             },
             ClientMessage::RealtimeInput { realtime_input } => {
-                format!("{{\"realtimeInput\":{}}}", serde_json::to_string(realtime_input)
-                    .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)))?)
+                format!("{{\"realtimeInput\":{}}}", 
+                    serde_json::to_string(realtime_input).map_err(GeminiError::Serialization)?)
             },
             ClientMessage::ToolResponse { tool_response } => {
-                format!("{{\"toolResponse\":{}}}", serde_json::to_string(tool_response)
-                    .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)))?)
+                format!("{{\"toolResponse\":{}}}", 
+                    serde_json::to_string(tool_response).map_err(GeminiError::Serialization)?)
             },
         };
-        println!("Sending message: {}", json);
-        self.ws.send(Message::text(json)).await
+        
+        debug!("Sending message: {}", json);
+        
+        if let Some(ws) = &mut self.ws {
+            ws.send(Message::text(json)).await.map_err(GeminiError::WebSocket)?;
+            Ok(())
+        } else {
+            Err(GeminiError::ConnectionClosed)
+        }
     }
-
-    /// Receive the next server message.
-    pub async fn next(&mut self) -> Option<Result<ServerMessage, WsError>> {
-        loop {
-            match self.ws.next().await? {
-                Ok(Message::Text(text)) => {
-                    println!("Received text message: {}", text);
-                    let parsed = serde_json::from_str::<ServerMessage>(&text)
-                        .map_err(|e| {
-                            println!("Error parsing message: {}", e);
-                            WsError::Io(io::Error::new(io::ErrorKind::Other, e))
-                        });
-                    return Some(parsed);
-                }
-                Ok(Message::Binary(bytes)) => {
-                    // Handle binary data - convert to string and parse
-                    match std::str::from_utf8(&bytes) {
-                        Ok(text) => {
-                            println!("Received binary message (as text): {}", text);
-                            let parsed = serde_json::from_str::<ServerMessage>(text)
-                                .map_err(|e| {
-                                    println!("Error parsing binary message: {}", e);
-                                    WsError::Io(io::Error::new(io::ErrorKind::Other, e))
-                                });
-                            return Some(parsed);
-                        }
-                        Err(e) => {
-                            println!("Error converting binary to string: {}", e);
-                            continue;
-                        }
+    
+    /// Send an audio chunk to the server.
+    pub async fn send_audio(&mut self, audio_data: &[u8], is_start: bool, is_end: bool) -> Result<()> {
+        // Encode audio data as base64
+        let data = general_purpose::STANDARD.encode(audio_data);
+        
+        let realtime_input = RealtimeInput {
+            audio: Some(RealtimeAudio {
+                data,
+                mime_type: "audio/pcm;rate=16000".to_string(),
+            }),
+            video: None,
+            text: None,
+            activity_start: if is_start { Some(true) } else { None },
+            activity_end: if is_end { Some(true) } else { None },
+            audio_stream_end: if is_end { Some(true) } else { None },
+        };
+        
+        let msg = ClientMessage::RealtimeInput { realtime_input };
+        self.send(&msg).await
+    }
+    
+    /// Send a video frame to the server.
+    pub async fn send_video(&mut self, frame_data: &[u8], mime_type: &str) -> Result<()> {
+        // Encode video data as base64
+        let data = general_purpose::STANDARD.encode(frame_data);
+        
+        let realtime_input = RealtimeInput {
+            audio: None,
+            video: Some(RealtimeVideo {
+                data,
+                mime_type: mime_type.to_string(),
+            }),
+            text: None,
+            activity_start: None,
+            activity_end: None,
+            audio_stream_end: None,
+        };
+        
+        let msg = ClientMessage::RealtimeInput { realtime_input };
+        self.send(&msg).await
+    }
+    
+    /// Send a text message to the server.
+    pub async fn send_text(&mut self, text: &str) -> Result<()> {
+        let client_content = serde_json::json!({
+            "turns": [{
+                "role": "user",
+                "parts": [{
+                    "text": text
+                }]
+            }],
+            "turnComplete": true
+        });
+        
+        let msg = ClientMessage::ClientContent { client_content };
+        self.send(&msg).await
+    }
+    
+    /// Send streaming text to the server (e.g. for partial typing).
+    pub async fn send_streaming_text(&mut self, text: &str) -> Result<()> {
+        let realtime_input = RealtimeInput {
+            audio: None,
+            video: None,
+            text: Some(text.to_string()),
+            activity_start: None,
+            activity_end: None,
+            audio_stream_end: None,
+        };
+        
+        let msg = ClientMessage::RealtimeInput { realtime_input };
+        self.send(&msg).await
+    }
+    
+    /// Receive the next response from the server.
+    pub async fn next_response(&mut self) -> Option<Result<ApiResponse>> {
+        self.response_rx.recv().await
+    }
+    
+    /// Stream responses until a condition is met.
+    pub async fn stream_responses<F>(&mut self, mut callback: F) -> Result<()>
+    where
+        F: FnMut(&ApiResponse) -> bool,
+    {
+        while let Some(response) = self.response_rx.recv().await {
+            match response {
+                Ok(resp) => {
+                    let should_stop = callback(&resp);
+                    if should_stop {
+                        break;
                     }
                 }
-                Ok(Message::Close(frame)) => {
-                    println!("WebSocket closed: {:?}", frame);
-                    return None;
-                }
-                Ok(other) => {
-                    println!("Received other message type: {:?}", other);
-                    continue;
-                }
                 Err(e) => {
-                    println!("WebSocket error: {:?}", e);
-                    return Some(Err(e));
+                    return Err(e);
                 }
             }
         }
+        
+        Ok(())
     }
 }
 
