@@ -32,9 +32,13 @@ async fn main() {
     tracing_subscriber::fmt::init();
     info!("starting gemini client example");
 
-    let url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService/BidiGenerateContent?key=YOUR_API_KEY";
+    // Get API key from environment variable
+    let api_key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY environment variable not set");
+    
+    // Use the Gemini Live API endpoint with your API key
+    let url = format!("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService/BidiGenerateContent?key={}", api_key);
 
-    match GeminiClient::connect(url).await {
+    match GeminiClient::connect(&*url).await {
         Ok(mut client) => {
             // Example: send setup then wait for response
             let setup = BidiGenerateContentSetup {

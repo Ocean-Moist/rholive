@@ -1,27 +1,45 @@
 #[cfg(feature = "capture")]
-use xcap::{Monitor, Capturer, Frame};
+use xcap::{Monitor, VideoRecorder, Frame};
 #[cfg(feature = "capture")]
 use std::error::Error;
+#[cfg(feature = "capture")]
+use std::sync::mpsc::Receiver;
 
 /// Captures frames from the primary monitor using the `xcap` crate.
 #[cfg(feature = "capture")]
 pub struct ScreenCapturer {
-    capturer: Capturer,
+    video_recorder: VideoRecorder,
+    frame_rx: Receiver<Frame>,
 }
 
 #[cfg(feature = "capture")]
 impl ScreenCapturer {
     /// Create a new screen capturer for the primary monitor.
     pub fn new() -> Result<Self, Box<dyn Error>> {
-        let monitor = Monitor::primary()?;
-        let capturer = Capturer::new(monitor)?;
-        Ok(Self { capturer })
+        // Get all monitors and use the first one
+        let monitors = Monitor::all()?;
+        if monitors.is_empty() {
+            return Err("No monitors found".into());
+        }
+        
+        // Find primary monitor if available
+        let monitor = monitors.iter()
+            .find(|m| m.is_primary().unwrap_or(false))
+            .unwrap_or(&monitors[0])
+            .clone();
+            
+        let (video_recorder, frame_rx) = monitor.video_recorder()?;
+        video_recorder.start()?;
+        
+        Ok(Self { video_recorder, frame_rx })
     }
 
     /// Capture a single frame of the screen.
     pub fn capture_frame(&mut self) -> Result<Frame, Box<dyn Error>> {
-        let frame = self.capturer.capture_frame()?;
-        Ok(frame)
+        match self.frame_rx.recv() {
+            Ok(frame) => Ok(frame),
+            Err(e) => Err(Box::new(e)),
+        }
     }
 }
 
