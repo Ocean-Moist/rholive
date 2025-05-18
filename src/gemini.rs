@@ -207,6 +207,93 @@ mod tests {
         assert!(wait_result.is_ok(), "Timed out waiting for response");
         assert!(got_response, "Did not receive text response from Gemini");
     }
+
+    #[tokio::test]
+    async fn test_handle_text_message_variants() {
+        let (tx, mut rx) = mpsc::channel(10);
+
+        // SetupComplete
+        let msg = serde_json::json!({"setupComplete": {}}).to_string();
+        GeminiClient::handle_text_message(&msg, &tx).await.unwrap();
+        match rx.recv().await.unwrap().unwrap() {
+            ApiResponse::SetupComplete => {}
+            other => panic!("Unexpected response: {:?}", other),
+        }
+
+        // ToolCall
+        let msg = serde_json::json!({"toolCall": {"id": "123"}}).to_string();
+        GeminiClient::handle_text_message(&msg, &tx).await.unwrap();
+        match rx.recv().await.unwrap().unwrap() {
+            ApiResponse::ToolCall(val) => {
+                assert_eq!(val["id"], "123");
+            }
+            other => panic!("Unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_server_content_variants() {
+        let (tx, mut rx) = mpsc::channel(10);
+
+        // Input transcription
+        let content = serde_json::json!({"inputTranscription": {"text": "hello", "isFinal": true}});
+        GeminiClient::handle_server_content(content, &tx).await.unwrap();
+        match rx.recv().await.unwrap().unwrap() {
+            ApiResponse::InputTranscription(t) => {
+                assert_eq!(t.text, "hello");
+                assert!(t.is_final);
+            }
+            other => panic!("Unexpected response: {:?}", other),
+        }
+
+        // Output transcription
+        let content = serde_json::json!({"outputTranscription": {"text": "hi", "isFinal": false}});
+        GeminiClient::handle_server_content(content, &tx).await.unwrap();
+        match rx.recv().await.unwrap().unwrap() {
+            ApiResponse::OutputTranscription(t) => {
+                assert_eq!(t.text, "hi");
+                assert!(!t.is_final);
+            }
+            other => panic!("Unexpected response: {:?}", other),
+        }
+
+        // Text response
+        let content = serde_json::json!({
+            "modelTurn": {"parts": [{"text": "done"}]},
+            "generationComplete": true
+        });
+        GeminiClient::handle_server_content(content, &tx).await.unwrap();
+        match rx.recv().await.unwrap().unwrap() {
+            ApiResponse::TextResponse { text, is_complete } => {
+                assert_eq!(text, "done");
+                assert!(is_complete);
+            }
+            other => panic!("Unexpected response: {:?}", other),
+        }
+
+        // Audio response
+        let data = general_purpose::STANDARD.encode(&[1u8, 2, 3]);
+        let content = serde_json::json!({
+            "modelTurn": {"parts": [{"inlineData": {"data": data}}]}
+        });
+        GeminiClient::handle_server_content(content, &tx).await.unwrap();
+        match rx.recv().await.unwrap().unwrap() {
+            ApiResponse::AudioResponse { data, is_complete } => {
+                assert_eq!(data, vec![1, 2, 3]);
+                assert!(!is_complete);
+            }
+            other => panic!("Unexpected response: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_enum_as_str() {
+        assert_eq!(ResponseModality::Text.as_str(), "TEXT");
+        assert_eq!(ResponseModality::Audio.as_str(), "AUDIO");
+        assert_eq!(MediaResolution::Low.as_str(), "MEDIA_RESOLUTION_LOW");
+        assert_eq!(MediaResolution::Medium.as_str(), "MEDIA_RESOLUTION_MEDIUM");
+        assert_eq!(MediaResolution::High.as_str(), "MEDIA_RESOLUTION_HIGH");
+    }
 }
 
 /// Generation configuration for setup.
