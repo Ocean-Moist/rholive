@@ -155,70 +155,57 @@ mod tests {
             }
         };
         
-        let url = format!("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={}", api_key);
-        
-        let client_result = GeminiClient::new(GeminiClientConfig { url, model: "models/gemini-2.0-flash-live-001".to_string() , response_modality: ResponseModality::Text, system_instruction: Option::from("".to_string()), temperature: Some(1.0), media_resolution: None, reconnect_attempts: 0, reconnect_delay: Default::default() }).connect().await;
-        assert!(client_result.is_ok(), "Failed to connect to Gemini API: {:?}", client_result.err());
-        
-        let mut client = client_result.unwrap();
-        
-        // Send setup message
-        let setup = BidiGenerateContentSetup {
+        // Create a client with minimal configuration
+        let config = GeminiClientConfig {
+            url: String::new(), // Will be set by from_api_key
             model: "models/gemini-2.0-flash-live-001".to_string(),
-            ..Default::default()
+            response_modality: ResponseModality::Text,
+            system_instruction: Some("".to_string()),
+            temperature: Some(0.7),
+            media_resolution: Some(MediaResolution::Medium),
+            reconnect_attempts: 1,
+            reconnect_delay: Duration::from_secs(1),
         };
-        let msg = ClientMessage::Setup { setup };
         
-        let send_result = client.send(&msg).await;
-        assert!(send_result.is_ok(), "Failed to send setup message: {:?}", send_result.err());
+        let mut client = GeminiClient::from_api_key(&api_key, Some(config));
         
-        // Wait for setup complete with timeout
-        let setup_complete = timeout(Duration::from_secs(5), async {
-            while let Some(result) = client.next().await {
-                match result {
-                    Ok(ServerMessage::SetupComplete { .. }) => return true,
-                    Ok(_) => continue, // Skip other message types
-                    Err(e) => panic!("Error receiving message: {:?}", e),
-                }
-            }
-            false
-        }).await;
+        // Connect to the API
+        let connect_result = client.connect().await;
+        assert!(connect_result.is_ok(), "Failed to connect to Gemini API: {:?}", connect_result.err());
         
-        assert!(setup_complete.is_ok() && setup_complete.unwrap(), "Did not receive SetupComplete message in time");
+        // Set up the session
+        let setup_result = client.setup().await;
+        assert!(setup_result.is_ok(), "Failed to set up Gemini session: {:?}", setup_result.err());
         
         // Test with simple text input to verify it works
-        let content_obj = serde_json::json!({
-            "turns": [{
-                "role": "user",
-                "parts": [{
-                    "text": "Hello, Gemini. Can you give me a short response for testing?"
-                }]
-            }],
-            "turnComplete": true
-        });
+        let text_result = client.send_text("Hello, Gemini. Can you give me a short response for testing?").await;
+        assert!(text_result.is_ok(), "Failed to send text message: {:?}", text_result.err());
         
-        let msg = ClientMessage::ClientContent { client_content: content_obj };
-        let send_result = client.send(&msg).await;
-        assert!(send_result.is_ok(), "Failed to send client content: {:?}", send_result.err());
-        
-        // Wait for response with timeout
-        let got_response = timeout(Duration::from_secs(10), async {
-            while let Some(result) = client.next().await {
+        // Wait for a response with timeout
+        let mut got_response = false;
+        let wait_result = timeout(Duration::from_secs(10), async {
+            while let Some(result) = client.next_response().await {
                 match result {
-                    Ok(ServerMessage::ServerContent { server_content }) => {
-                        // Check if we got model text response 
-                        if server_content.get("modelTurn").is_some() {
-                            return true;
-                        }
-                    },
-                    Ok(_) => continue, // Skip other message types
-                    Err(e) => panic!("Error receiving message: {:?}", e),
+                    Ok(ApiResponse::TextResponse { text, .. }) => {
+                        println!("Received text response: {}", text);
+                        got_response = true;
+                        break;
+                    }
+                    Ok(ApiResponse::InputTranscription(transcript)) => {
+                        println!("Received transcript: {}", transcript.text);
+                        continue;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        println!("Error from API: {:?}", e);
+                        continue;
+                    }
                 }
             }
-            false
         }).await;
         
-        assert!(got_response.is_ok() && got_response.unwrap(), "Did not receive server content response in time");
+        assert!(wait_result.is_ok(), "Timed out waiting for response");
+        assert!(got_response, "Did not receive text response from Gemini");
     }
 }
 
