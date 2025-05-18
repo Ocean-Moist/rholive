@@ -1,7 +1,9 @@
 mod audio;
+#[cfg(feature = "capture")]
 mod screen;
 
 use audio::AudioCapturer;
+#[cfg(feature = "capture")]
 use screen::ScreenCapturer;
 
 mod gemini;
@@ -10,17 +12,22 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() {
-    // Initialize audio and screen capture to demonstrate bindings are callable.
+    // Initialize audio capture and optionally screen capture.
     let mut audio = AudioCapturer::new("rholive").expect("audio init");
+    #[cfg(feature = "capture")]
     let mut screen = ScreenCapturer::new().expect("screen init");
 
     // Read a small chunk of audio and capture one frame.
     let mut buffer = [0u8; 3200]; // ~100ms of 16 kHz mono S16LE
     audio.read(&mut buffer).expect("audio read");
 
+    #[cfg(feature = "capture")]
     let _frame = screen.capture_frame().expect("screen capture");
 
+    #[cfg(feature = "capture")]
     println!("Captured audio chunk and screen frame");
+    #[cfg(not(feature = "capture"))]
+    println!("Captured audio chunk");
   
     tracing_subscriber::fmt::init();
     info!("starting gemini client example");
