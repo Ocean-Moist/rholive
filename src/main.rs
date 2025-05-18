@@ -36,7 +36,7 @@ async fn main() {
     let api_key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY environment variable not set");
     
     // Use the Gemini Live API endpoint with your API key
-    let url = format!("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService/BidiGenerateContent?key={}", api_key);
+    let url = format!("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={}", api_key);
 
     match GeminiClient::connect(&*url).await {
         Ok(mut client) => {

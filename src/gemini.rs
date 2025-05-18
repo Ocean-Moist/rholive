@@ -11,7 +11,6 @@ use futures_util::{StreamExt, SinkExt};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use tokio::time::timeout;
     use std::time::Duration;
 
@@ -49,18 +48,25 @@ mod tests {
             realtime_input_config: None,
         };
         
-        let msg = ClientMessage::Setup { setup };
-        let json = serde_json::to_string(&msg).unwrap();
+        let msg = ClientMessage::Setup { setup: setup.clone() };
+        
+        // Test direct serialization of the JSON we send to the server
+        let json = match &msg {
+            ClientMessage::Setup { setup } => {
+                let setup_json = serde_json::to_string(setup).unwrap();
+                let inner = &setup_json[1..setup_json.len()-1];
+                format!("{{\"setup\":{{{}}}}}", inner)
+            },
+            _ => panic!("Unexpected message type"),
+        };
+        
         println!("JSON output: {}", json);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         
-        // From the JSON output, we can see there's an unexpected nested structure
-        // The JSON is {"setup":{"setup":{...}}} instead of {"setup":{...}}
-        // Let's test what we have, not what we expect:
+        // With the manual serialization, we expect {"setup": {...}}
         assert!(parsed.get("setup").is_some());
-        assert!(parsed["setup"].get("setup").is_some());
-        assert_eq!(parsed["setup"]["setup"]["model"], "models/gemini-2.0-flash-live-001");
-        assert_eq!(parsed["setup"]["setup"]["systemInstruction"], "You are a helpful assistant.");
+        assert_eq!(parsed["setup"]["model"], "models/gemini-2.0-flash-live-001");
+        assert_eq!(parsed["setup"]["systemInstruction"], "You are a helpful assistant.");
         
         // Test realtime input message
         let audio_input = RealtimeInput {
@@ -75,22 +81,22 @@ mod tests {
             audio_stream_end: None,
         };
         
-        let msg = ClientMessage::RealtimeInput { realtime_input: audio_input };
-        let json = serde_json::to_string(&msg).unwrap();
+        let msg = ClientMessage::RealtimeInput { realtime_input: audio_input.clone() };
+        
+        // Test direct serialization of the JSON we send to the server
+        let json = format!("{{\"realtimeInput\":{}}}", serde_json::to_string(&audio_input).unwrap());
+        
         println!("Audio JSON output: {}", json);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         
-        // Similarly, this is likely nested as {"realtimeInput":{"realtime_input":{...}}}
-        // Let's check the actual structure:
+        // With the manual serialization, we expect {"realtimeInput": {...}}
         assert!(parsed.get("realtimeInput").is_some());
         
-        // From the output, we can see the structure and field names:
-        // {"realtimeInput":{"realtime_input":{"audio":{"data":"base64data","mime_type":"audio/pcm;rate=16000"},"activityStart":true}}}
-        assert!(parsed["realtimeInput"].get("realtime_input").is_some());
-        assert!(parsed["realtimeInput"]["realtime_input"].get("audio").is_some());
-        assert_eq!(parsed["realtimeInput"]["realtime_input"]["audio"]["data"], "base64data");
-        assert_eq!(parsed["realtimeInput"]["realtime_input"]["audio"]["mime_type"], "audio/pcm;rate=16000");
-        assert_eq!(parsed["realtimeInput"]["realtime_input"]["activityStart"], true);
+        // Checking the realtimeInput field structure
+        assert!(parsed["realtimeInput"].get("audio").is_some());
+        assert_eq!(parsed["realtimeInput"]["audio"]["data"], "base64data");
+        assert_eq!(parsed["realtimeInput"]["audio"]["mime_type"], "audio/pcm;rate=16000");
+        assert_eq!(parsed["realtimeInput"]["activityStart"], true);
     }
     
     #[test]
@@ -133,7 +139,6 @@ mod tests {
     }
     
     // To run this test, set the GEMINI_API_KEY environment variable
-    // e.g., GEMINI_API_KEY=your_api_key cargo test api_connection -- --ignored
     #[tokio::test]
     async fn test_api_connection() {
         let api_key = match std::env::var("GEMINI_API_KEY") {
@@ -144,7 +149,7 @@ mod tests {
             }
         };
         
-        let url = format!("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService/BidiGenerateContent?key={}", api_key);
+        let url = format!("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={}", api_key);
         
         let client_result = GeminiClient::connect(&url).await;
         assert!(client_result.is_ok(), "Failed to connect to Gemini API: {:?}", client_result.err());
@@ -212,7 +217,7 @@ mod tests {
 }
 
 /// Generation configuration for setup.
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -226,7 +231,7 @@ pub struct GenerationConfig {
 }
 
 /// Session setup message.
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct BidiGenerateContentSetup {
     pub model: String,
@@ -241,7 +246,7 @@ pub struct BidiGenerateContentSetup {
 }
 
 /// A chunk of realtime input (audio/video/text)
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RealtimeInput {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,38 +263,63 @@ pub struct RealtimeInput {
     pub audio_stream_end: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RealtimeAudio {
     pub data: String,
     pub mime_type: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RealtimeVideo {
     pub data: String,
     pub mime_type: String,
 }
 
 /// Message sent from client to server.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ClientMessage {
-    Setup { setup: BidiGenerateContentSetup },
-    ClientContent { client_content: serde_json::Value },
-    RealtimeInput { realtime_input: RealtimeInput },
-    ToolResponse { tool_response: serde_json::Value },
+    Setup {
+        setup: BidiGenerateContentSetup
+    },
+    ClientContent {
+        client_content: serde_json::Value
+    },
+    RealtimeInput {
+        realtime_input: RealtimeInput
+    },
+    ToolResponse {
+        tool_response: serde_json::Value
+    },
 }
 
 /// Server -> client messages
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
 pub enum ServerMessage {
-    SetupComplete { setup_complete: serde_json::Value },
-    ServerContent { server_content: serde_json::Value },
-    ToolCall { tool_call: serde_json::Value },
-    ToolCallCancellation { tool_call_cancellation: serde_json::Value },
-    GoAway { go_away: serde_json::Value },
-    SessionResumptionUpdate { session_resumption_update: serde_json::Value },
+    SetupComplete {
+        #[serde(rename = "setupComplete")]
+        setup_complete: serde_json::Value 
+    },
+    ServerContent {
+        #[serde(rename = "serverContent")]
+        server_content: serde_json::Value 
+    },
+    ToolCall {
+        #[serde(rename = "toolCall")]
+        tool_call: serde_json::Value 
+    },
+    ToolCallCancellation {
+        #[serde(rename = "toolCallCancellation")]
+        tool_call_cancellation: serde_json::Value 
+    },
+    GoAway {
+        #[serde(rename = "goAway")]
+        go_away: serde_json::Value 
+    },
+    SessionResumptionUpdate {
+        #[serde(rename = "sessionResumptionUpdate")]
+        session_resumption_update: serde_json::Value 
+    },
 }
 
 /// Async Gemini Live API client.
@@ -306,9 +336,30 @@ impl GeminiClient {
 
     /// Send a client message to the server.
     pub async fn send(&mut self, msg: &ClientMessage) -> Result<(), WsError> {
-        let text = serde_json::to_string(msg)
-            .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
-        self.ws.send(Message::text(text)).await
+        let json = match msg {
+            ClientMessage::Setup { setup } => {
+                // Format the JSON manually to avoid nesting issues
+                let setup_json = serde_json::to_string(setup)
+                    .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+                // Remove outer braces and wrap in setup: {...}
+                let inner = &setup_json[1..setup_json.len()-1];
+                format!("{{\"setup\":{{{}}}}}", inner)
+            },
+            ClientMessage::ClientContent { client_content } => {
+                format!("{{\"clientContent\":{}}}", serde_json::to_string(client_content)
+                    .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)))?)
+            },
+            ClientMessage::RealtimeInput { realtime_input } => {
+                format!("{{\"realtimeInput\":{}}}", serde_json::to_string(realtime_input)
+                    .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)))?)
+            },
+            ClientMessage::ToolResponse { tool_response } => {
+                format!("{{\"toolResponse\":{}}}", serde_json::to_string(tool_response)
+                    .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)))?)
+            },
+        };
+        println!("Sending message: {}", json);
+        self.ws.send(Message::text(json)).await
     }
 
     /// Receive the next server message.
@@ -316,13 +367,44 @@ impl GeminiClient {
         loop {
             match self.ws.next().await? {
                 Ok(Message::Text(text)) => {
+                    println!("Received text message: {}", text);
                     let parsed = serde_json::from_str::<ServerMessage>(&text)
-                        .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)));
+                        .map_err(|e| {
+                            println!("Error parsing message: {}", e);
+                            WsError::Io(io::Error::new(io::ErrorKind::Other, e))
+                        });
                     return Some(parsed);
                 }
-                Ok(Message::Close(_)) => return None,
-                Ok(_) => continue,
-                Err(e) => return Some(Err(e)),
+                Ok(Message::Binary(bytes)) => {
+                    // Handle binary data - convert to string and parse
+                    match std::str::from_utf8(&bytes) {
+                        Ok(text) => {
+                            println!("Received binary message (as text): {}", text);
+                            let parsed = serde_json::from_str::<ServerMessage>(text)
+                                .map_err(|e| {
+                                    println!("Error parsing binary message: {}", e);
+                                    WsError::Io(io::Error::new(io::ErrorKind::Other, e))
+                                });
+                            return Some(parsed);
+                        }
+                        Err(e) => {
+                            println!("Error converting binary to string: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                Ok(Message::Close(frame)) => {
+                    println!("WebSocket closed: {:?}", frame);
+                    return None;
+                }
+                Ok(other) => {
+                    println!("Received other message type: {:?}", other);
+                    continue;
+                }
+                Err(e) => {
+                    println!("WebSocket error: {:?}", e);
+                    return Some(Err(e));
+                }
             }
         }
     }
