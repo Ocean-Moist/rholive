@@ -1,5 +1,6 @@
-use libpulse_simple_binding::{Simple, Direction};
-use libpulse_simple_binding::sample::{Spec, Format};
+use libpulse_simple_binding::Simple;
+use libpulse_binding::stream::Direction;
+use libpulse_binding::sample::{Spec, Format};
 use std::error::Error;
 
 /// Captures audio from the default system source using PulseAudio's
@@ -12,7 +13,7 @@ impl AudioCapturer {
     /// Create a new `AudioCapturer` using the default device.
     pub fn new(app_name: &str) -> Result<Self, Box<dyn Error>> {
         let spec = Spec {
-            format: Format::S16LE,
+            format: Format::S16le,
             channels: 1,
             rate: 16_000,
         };

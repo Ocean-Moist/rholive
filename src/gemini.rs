@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_tungstenite::tungstenite::Error as WsError;
+use std::io;
 use futures_util::{StreamExt, SinkExt};
 
 /// Generation configuration for setup.
@@ -102,21 +103,24 @@ impl GeminiClient {
 
     /// Send a client message to the server.
     pub async fn send(&mut self, msg: &ClientMessage) -> Result<(), WsError> {
-        let text = serde_json::to_string(msg).map_err(|e| WsError::Protocol(e.to_string()))?;
-        self.ws.send(Message::Text(text)).await
+        let text = serde_json::to_string(msg)
+            .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+        self.ws.send(Message::text(text)).await
     }
 
     /// Receive the next server message.
     pub async fn next(&mut self) -> Option<Result<ServerMessage, WsError>> {
-        match self.ws.next().await? {
-            Ok(Message::Text(text)) => {
-                let parsed = serde_json::from_str::<ServerMessage>(&text)
-                    .map_err(|e| WsError::Protocol(e.to_string()));
-                Some(parsed)
+        loop {
+            match self.ws.next().await? {
+                Ok(Message::Text(text)) => {
+                    let parsed = serde_json::from_str::<ServerMessage>(&text)
+                        .map_err(|e| WsError::Io(io::Error::new(io::ErrorKind::Other, e)));
+                    return Some(parsed);
+                }
+                Ok(Message::Close(_)) => return None,
+                Ok(_) => continue,
+                Err(e) => return Some(Err(e)),
             }
-            Ok(Message::Close(_)) => None,
-            Ok(_) => self.next().await,
-            Err(e) => Some(Err(e)),
         }
     }
 }

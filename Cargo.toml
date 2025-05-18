@@ -5,14 +5,17 @@ edition = "2021"
 
 
 [dependencies]
-xcap = "0.6.0"
+xcap = { version = "0.6.0", optional = true }
 libpulse-simple-binding = "2.28"
+libpulse-binding = "2.30"
 tokio-tungstenite = "0.26.2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio = { version = "1.37", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-egui = "0.31.1"
-egui_window_glfw_passthrough = "0.9.0"
-glow = "0.16.0"
+futures-util = "0.3"
+
+[features]
+default = []
+capture = ["xcap"]
