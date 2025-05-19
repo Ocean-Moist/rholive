@@ -4,8 +4,6 @@
 //! screen content, and microphone. It integrates with Google's Gemini Live API
 //! to provide AI-powered responses to user interactions.
 
-#![forbid(unsafe_code)]
-
 /// Audio capture module for system and microphone audio
 mod audio;
 /// Screen capture module (enabled with the "capture" feature)
