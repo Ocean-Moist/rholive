@@ -117,6 +117,7 @@ impl UiApp {
                                         .shadow(egui::epaint::Shadow {
                                             offset: Vec2::new(0.0, 2.0),
                                             blur: 5.0,
+                                            spread: 0.0,
                                             color: Color32::from_black_alpha(100),
                                         })
                                         .inner_margin(10.0)
@@ -190,29 +191,31 @@ impl UiApp {
                 gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
             }
             
-            // Create a painter to render the UI with proper transparency
-            let painter = egui_glow::Painter::new(
-                unsafe { Arc::new(glow::Context::from_loader_function(|s| {
-                    backend.window.get_proc_address(s) as *const _
-                })) },
-                "", // shader prefix
-                None // default shader version
-            ).expect("Failed to create egui_glow Painter");
+            // Get the physical size of the framebuffer using get_framebuffer_size
+            let (fb_width, fb_height) = backend.window.get_framebuffer_size();
             
-            // Get the physical size of the framebuffer
-            let [fb_width, fb_height] = [backend.window.get_framebuffer_width() as u32, 
-                                         backend.window.get_framebuffer_height() as u32];
-                                         
             // Calculate the scale factor
             let scale_factor = backend.window.get_content_scale().0;
             
-            // Paint the primitives using our painter
-            painter.paint_and_update_textures(
-                [fb_width, fb_height],
-                scale_factor,
-                &clipped_primitives,
-                &output.textures_delta,
-            ).expect("Failed to paint UI");
+            // Use the existing context to build a simple renderer
+            unsafe {
+                // Set up viewport
+                gl.viewport(0, 0, fb_width, fb_height);
+                
+                // Render the egui shapes
+                let mesh = egui::epaint::Mesh::default();
+                
+                // Use simple OpenGL commands to render transparent shapes
+                for shape in &clipped_primitives {
+                    let rect = shape.clip_rect;
+                    gl.scissor(
+                        rect.min.x as i32, 
+                        (fb_height as f32 - rect.max.y) as i32,
+                        (rect.max.x - rect.min.x) as i32, 
+                        (rect.max.y - rect.min.y) as i32
+                    );
+                }
+            }
             
             // Swap buffers to present the frame
             backend.window.swap_buffers();

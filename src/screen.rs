@@ -136,13 +136,32 @@ impl ScreenCapturer {
         }
         
         // Try to receive a frame with timeout
-        match self.frame_rx.recv_timeout(Duration::from_millis(500)) {
+        match self.frame_rx.recv_timeout(Duration::from_millis(800)) { // Increased timeout
             Ok(frame) => {
+                tracing::debug!("Captured frame: {}x{}", frame.width, frame.height);
                 self.last_capture = now;
                 Ok(CapturedFrame::new(frame))
             },
-            Err(e) => Err(Box::new(e)),
+            Err(e) => {
+                // Log the error but don't propagate timeout errors as they're expected
+                if let std::sync::mpsc::RecvTimeoutError::Timeout = e {
+                    tracing::debug!("Timed out waiting for screen frame, this is normal");
+                    Err("Frame capture timeout".into())
+                } else {
+                    tracing::error!("Error receiving frame from xcap: {:?}", e);
+                    Err(Box::new(e))
+                }
+            },
         }
+    }
+    
+    /// Force a frame capture regardless of interval
+    pub fn force_capture_frame(&mut self) -> Result<CapturedFrame, Box<dyn Error>> {
+        // Reset the last capture time
+        self.last_capture = std::time::Instant::now() - self.capture_interval - Duration::from_millis(1);
+        
+        // Now try regular capture
+        self.capture_frame()
     }
     
     /// Configure the capture interval (minimum time between frames)

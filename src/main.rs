@@ -226,7 +226,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Audio capture setup
     let mut buffer = [0u8; 3200]; // ~100ms of 16 kHz mono S16LE
     let mut is_first_chunk = true;
-    let mut frame_counter = 0;
     let mut last_successful_frame_time = std::time::Instant::now();
     let mut consecutive_audio_errors = 0;
     
@@ -286,7 +285,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         
         // VIDEO CAPTURE AND PROCESSING - maintain steady 2 fps
-        frame_counter += 1;
         
         // Try to capture a frame on each cycle to maintain 2 fps
         // The capture_interval in the ScreenCapturer will limit actual captures
