@@ -169,7 +169,7 @@ impl ScreenCapturer {
         match self.frame_rx.recv_timeout(Duration::from_millis(800)) {
             // Increased timeout
             Ok(frame) => {
-                tracing::debug!("Captured frame: {}x{}", frame.width, frame.height);
+                debug!("Captured frame: {}x{}", frame.width, frame.height);
 
                 // Calculate hash for deduplication
                 let frame_hash = Self::calculate_frame_hash(&frame);
@@ -191,7 +191,7 @@ impl ScreenCapturer {
             Err(e) => {
                 // Log the error but don't propagate timeout errors as they're expected
                 if let std::sync::mpsc::RecvTimeoutError::Timeout = e {
-                    tracing::debug!("Timed out waiting for screen frame, this is normal");
+                    debug!("Timed out waiting for screen frame, this is normal");
                     Err("Frame capture timeout".into())
                 } else {
                     tracing::error!("Error receiving frame from xcap: {:?}", e);
@@ -210,7 +210,7 @@ impl ScreenCapturer {
         // For forced captures, we'll still capture even if it's a duplicate
         match self.frame_rx.recv_timeout(Duration::from_millis(800)) {
             Ok(frame) => {
-                tracing::debug!("Forced capture of frame: {}x{}", frame.width, frame.height);
+                debug!("Forced capture of frame: {}x{}", frame.width, frame.height);
 
                 // Calculate hash for future comparison
                 let frame_hash = Self::calculate_frame_hash(&frame);
@@ -224,7 +224,7 @@ impl ScreenCapturer {
             Err(e) => {
                 // Log the error but don't propagate timeout errors as they're expected
                 if let std::sync::mpsc::RecvTimeoutError::Timeout = e {
-                    tracing::debug!("Timed out waiting for forced screen frame");
+                    debug!("Timed out waiting for forced screen frame");
                     Err("Frame capture timeout".into())
                 } else {
                     tracing::error!("Error receiving forced frame from xcap: {:?}", e);

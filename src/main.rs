@@ -138,7 +138,7 @@ async fn async_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize audio capture with fallback between devices
     info!("Initializing audio capture with device fallback");
     // First list available audio devices for UI
-    let audio_devices = match audio::AudioCapturer::list_devices(audio::DeviceType::Any) {
+    let audio_devices = match AudioCapturer::list_devices(audio::DeviceType::Any) {
         Ok(devices) => {
             info!("Found {} audio devices", devices.len());
             // Log each device for debugging
@@ -593,59 +593,57 @@ async fn async_main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         // Try to capture a frame on each cycle to maintain 2 fps
         // The capture_interval in the ScreenCapturer will limit actual captures
-        if true {
-            // Check if we should try to capture a frame
-            let now = std::time::Instant::now();
-            let time_since_last_frame = now.duration_since(last_successful_frame_time);
+        // Check if we should try to capture a frame
+        let now = std::time::Instant::now();
+        let time_since_last_frame = now.duration_since(last_successful_frame_time);
 
-            // If it's been too long since our last successful frame, force a capture
-            tdbg!("▶ screen.capture_frame() — entering");
-            let scr_start = std::time::Instant::now();
-            let frame_result = if time_since_last_frame > Duration::from_secs(6) {
-                debug!("Too long since last frame, forcing capture");
-                screen.force_capture_frame()
-            } else {
-                screen.capture_frame()
-            };
-            tdbg!("⏹ screen.capture_frame() — {:?}", scr_start.elapsed());
+        // If it's been too long since our last successful frame, force a capture
+        tdbg!("▶ screen.capture_frame() — entering");
+        let scr_start = std::time::Instant::now();
+        let frame_result = if time_since_last_frame > Duration::from_secs(6) {
+            debug!("Too long since last frame, forcing capture");
+            screen.force_capture_frame()
+        } else {
+            screen.capture_frame()
+        };
+        tdbg!("⏹ screen.capture_frame() — {:?}", scr_start.elapsed());
 
-            match frame_result {
-                Ok(mut frame) => {
-                    let width = frame.width();
-                    let height = frame.height();
-                    let mime_type = frame.mime_type().to_string();
+        match frame_result {
+            Ok(mut frame) => {
+                let width = frame.width();
+                let height = frame.height();
+                let mime_type = frame.mime_type().to_string();
 
-                    // Convert frame to JPEG and send to Gemini
-                    match frame.to_jpeg() {
-                        Ok(jpeg_data) => {
-                            debug!("Captured screen frame: {}x{} ready to send", width, height);
+                // Convert frame to JPEG and send to Gemini
+                match frame.to_jpeg() {
+                    Ok(jpeg_data) => {
+                        debug!("Captured screen frame: {}x{} ready to send", width, height);
 
-                            let mut gemini_guard = gemini_clone.lock().await;
-                            if let Err(e) = gemini_guard.send_video(&jpeg_data, &mime_type).await {
-                                error!("Failed to send video frame: {:?}", e);
-                            } else {
-                                // Update last successful frame time
-                                last_successful_frame_time = now;
-                            }
-                            drop(gemini_guard);
+                        let mut gemini_guard = gemini_clone.lock().await;
+                        if let Err(e) = gemini_guard.send_video(&jpeg_data, &mime_type).await {
+                            error!("Failed to send video frame: {:?}", e);
+                        } else {
+                            // Update last successful frame time
+                            last_successful_frame_time = now;
                         }
-                        Err(e) => {
-                            error!("Failed to convert frame to JPEG: {:?}", e);
-                        }
+                        drop(gemini_guard);
                     }
-                }
-                Err(e) => {
-                    // Only log certain errors at debug level since they're expected
-                    if e.to_string().contains("timeout") {
-                        debug!("Frame capture timeout (normal): {}", e);
-                    } else if e.to_string().contains("Duplicate frame") {
-                        debug!("Skipping duplicate frame (optimization)");
-                    } else {
-                        error!("Failed to capture screen frame: {:?}", e);
+                    Err(e) => {
+                        error!("Failed to convert frame to JPEG: {:?}", e);
                     }
                 }
             }
-        }
+            Err(e) => {
+                // Only log certain errors at debug level since they're expected
+                if e.to_string().contains("timeout") {
+                    debug!("Frame capture timeout (normal): {}", e);
+                } else if e.to_string().contains("Duplicate frame") {
+                    debug!("Skipping duplicate frame (optimization)");
+                } else {
+                    error!("Failed to capture screen frame: {:?}", e);
+                }
+            }
+        };
 
         // Reduce main loop delay to maintain steady frame rate
         // Each loop iteration should take about 100ms for proper timing with 500ms capture interval

@@ -2,7 +2,6 @@ use egui::{Color32, Context, FontId, RichText, Stroke, Vec2};
 use egui_glow::Painter;
 use egui_window_glfw_passthrough::glfw::Context as GlfwContext;
 use egui_window_glfw_passthrough::{glfw, GlfwBackend, GlfwConfig};
-use glow;
 use std::sync::{Arc, Mutex};
 
 pub struct UiState {

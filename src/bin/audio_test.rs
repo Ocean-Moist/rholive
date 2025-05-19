@@ -41,11 +41,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("🎤 Audio Segmentation Demo");
     println!("This demo visualizes how your speech is broken into semantic segments");
     println!("as you speak. It uses the same segmentation system as the main app.");
-    println!("");
+    println!();
     println!("Try speaking in sentences or with pauses and observe how segments");
     println!("are created. The segmenter now aggressively detects 'valid clauses'");
     println!("even when you're still speaking.");
-    println!("");
+    println!();
     println!("Press Ctrl+C to exit\n");
 
     // Initialize audio capture

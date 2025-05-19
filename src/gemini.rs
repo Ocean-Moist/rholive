@@ -5,7 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tracing::error;
 
@@ -273,27 +272,4 @@ impl MediaResolution {
             Self::High => "MEDIA_RESOLUTION_HIGH",
         }
     }
-}
-
-/// Connection state of the Gemini client
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectionState {
-    Disconnected,
-    Connecting,
-    Connected,
-    SetupComplete,
-}
-
-/// Async Gemini Live API client with streaming support.
-pub struct GeminiClient {
-    config: GeminiClientConfig,
-    ws: Option<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    >,
-    state: ConnectionState,
-    session_token: Option<String>,
-    response_tx: mpsc::Sender<Result<ApiResponse>>,
-    response_rx: mpsc::Receiver<Result<ApiResponse>>,
 }

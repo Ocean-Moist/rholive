@@ -17,7 +17,6 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info};
 
-use crate::tdbg;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +27,7 @@ type WsSink = Arc<
             tokio_tungstenite::WebSocketStream<
                 tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
             >,
-            tokio_tungstenite::tungstenite::Message,
+            Message,
         >,
     >,
 >;
@@ -460,7 +459,7 @@ impl GeminiClient {
         };
 
         // Configure for client-side VAD (since we're using Whisper-based segmentation)
-        let mut config_map = realtime_config.as_object_mut().unwrap();
+        let config_map = realtime_config.as_object_mut().unwrap();
 
         // Disable automatic activity detection since we're doing client-side VAD
         config_map.insert(

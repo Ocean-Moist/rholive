@@ -5,7 +5,6 @@
 //! for semantic segmentation based on the content of speech.
 
 use crate::gemini_client;
-use std::collections::VecDeque;
 use std::path::Path;
 use std::time::Instant;
 use tracing::{debug, error, info, span, warn, Level};
@@ -125,7 +124,7 @@ impl AudioSegmenter {
     /// Create a new AudioSegmenter with the given configuration and optional Whisper model
     pub fn new(cfg: SegConfig, whisper_path: Option<&Path>) -> Result<Self> {
         // 16 kHz, very aggressive mode for more sensitive voice detection
-        let mut vad = Vad::new_with_rate_and_mode(SampleRate::Rate16kHz, VadMode::VeryAggressive);
+        let vad = Vad::new_with_rate_and_mode(SampleRate::Rate16kHz, VadMode::VeryAggressive);
 
         // Try to load Whisper model if path is provided and whisper_gate is enabled
         let (whisper_ctx, whisper_state) = if cfg.whisper_gate && whisper_path.is_some() {
@@ -349,13 +348,13 @@ impl AudioSegmenter {
                     // Check if we have any segments
                     if n_segments > 0 {
                         // Get the text from the first segment
-                        match state.full_get_segment_text(0) {
+                        return match state.full_get_segment_text(0) {
                             Ok(text) => {
-                                return Ok(Some(text));
+                                Ok(Some(text))
                             }
                             Err(e) => {
                                 error!("Failed to get segment text: {}", e);
-                                return Err(SegmentationError::WhisperError(e.to_string()));
+                                Err(SegmentationError::WhisperError(e.to_string()))
                             }
                         }
                     }
