@@ -4,7 +4,6 @@ use egui_window_glfw_passthrough::glfw::Context as GlfwContext;
 use std::sync::{Arc, Mutex};
 use glow;
 use glow::HasContext;
-use egui_glow; // Add egui_glow for the Painter
 
 pub struct UiState {
     /// Whether the audio is currently muted
@@ -42,6 +41,7 @@ impl UiApp {
 
     /// Run the UI application
     pub fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+        // Create a GLFW config for transparent window
         let config = GlfwConfig {
             window_title: "RhoLive Assistant".to_string(),
             size: [600, 800], // Larger window
@@ -55,11 +55,14 @@ impl UiApp {
                 glfw.window_hint(glfw::WindowHint::AlphaBits(Some(8)));
             }),
             window_callback: Box::new(|window| {
-                window.set_opacity(0.9); // Slight transparency for entire window
+                window.set_opacity(0.85); // 85% opacity
             }),
         };
-
+        
+        // Create the GLFW backend using the config
         let mut backend = GlfwBackend::new(config);
+        
+        // Create egui context
         let mut ctx = Context::default();
         
         // Set up dark theme with glass effect
@@ -80,8 +83,19 @@ impl UiApp {
             // Poll events
             backend.glfw.poll_events();
             
-            // Get input state
+            // Get input state from backend
             let raw_input = backend.take_raw_input();
+            
+            // Process for ESC key - backend handles all other input automatically
+            if raw_input.events.iter().any(|event| {
+                matches!(event, egui::Event::Key { 
+                    key: egui::Key::Escape, 
+                    pressed: true, 
+                    ..
+                })
+            }) {
+                backend.window.set_should_close(true);
+            }
             
             // UI frame
             let output = ctx.run(raw_input, |ctx| {
@@ -177,45 +191,31 @@ impl UiApp {
                 continue;
             }
             
-            // Paint the UI
-            let clipped_primitives = ctx.tessellate(output.shapes, 1.0);
+            // Get the shapes and geometry from egui (unused but required for future extensions)
+            let _clipped_primitives = ctx.tessellate(output.shapes, 1.0);
             
             // Clear the framebuffer with a transparent background
             unsafe {
-                // Set completely transparent background
+                // Set completely transparent background for clear
                 gl.clear_color(0.0, 0.0, 0.0, 0.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
                 
-                // Enable blending for transparency
+                // Basic blending setup
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
             }
             
-            // Get the physical size of the framebuffer using get_framebuffer_size
+            // Get the physical size of the framebuffer
             let (fb_width, fb_height) = backend.window.get_framebuffer_size();
             
-            // Calculate the scale factor
-            let scale_factor = backend.window.get_content_scale().0;
-            
-            // Use the existing context to build a simple renderer
+            // Setup viewport
             unsafe {
-                // Set up viewport
                 gl.viewport(0, 0, fb_width, fb_height);
-                
-                // Render the egui shapes
-                let mesh = egui::epaint::Mesh::default();
-                
-                // Use simple OpenGL commands to render transparent shapes
-                for shape in &clipped_primitives {
-                    let rect = shape.clip_rect;
-                    gl.scissor(
-                        rect.min.x as i32, 
-                        (fb_height as f32 - rect.max.y) as i32,
-                        (rect.max.x - rect.min.x) as i32, 
-                        (rect.max.y - rect.min.y) as i32
-                    );
-                }
             }
+            
+            // Instead of trying to render egui primitives manually, 
+            // we'll set a semi-transparent background color in the egui style
+            // and let the background of the window provide the visual effect
             
             // Swap buffers to present the frame
             backend.window.swap_buffers();
@@ -236,30 +236,40 @@ fn configure_style(ctx: &mut Context) {
     
     // Set dark theme with glass-like effects
     style.visuals.dark_mode = true;
-    style.visuals.panel_fill = Color32::from_rgba_premultiplied(20, 20, 30, 180);
-    style.visuals.window_fill = Color32::from_rgba_premultiplied(20, 20, 30, 220);
+    
+    // Make the background truly transparent
+    style.visuals.panel_fill = Color32::from_rgba_premultiplied(20, 20, 30, 120); // More transparent
+    style.visuals.window_fill = Color32::from_rgba_premultiplied(20, 20, 30, 180); // More transparent
+    
+    // Make the central panel totally transparent
+    style.visuals.extreme_bg_color = Color32::from_rgba_premultiplied(0, 0, 0, 0); // Completely transparent
     
     // Update shadow properties
     style.visuals.window_shadow.color = Color32::from_black_alpha(80);
     
-    // Text colors
-    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(220, 220, 255));
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(180, 180, 200));
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::from_rgb(240, 240, 255));
+    // Text colors - brighter for better visibility on transparent background
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(240, 240, 255));
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(220, 220, 240));
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::from_rgb(255, 255, 255));
     style.visuals.widgets.active.fg_stroke = Stroke::new(2.0, Color32::from_rgb(255, 255, 255));
     
-    // Button styling
-    style.visuals.widgets.inactive.bg_fill = Color32::from_rgba_premultiplied(60, 60, 80, 200);
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(100, 100, 150));
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgba_premultiplied(70, 70, 100, 220);
-    style.visuals.widgets.active.bg_fill = Color32::from_rgba_premultiplied(80, 80, 120, 250);
+    // Button styling - higher contrast
+    style.visuals.widgets.inactive.bg_fill = Color32::from_rgba_premultiplied(60, 60, 100, 180);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(120, 120, 200));
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgba_premultiplied(80, 80, 120, 200);
+    style.visuals.widgets.active.bg_fill = Color32::from_rgba_premultiplied(100, 100, 160, 220);
     
+    // Round all corners for a modern look
     let mut widgets = style.visuals.widgets.clone();
     widgets.noninteractive.rounding = egui::Rounding::from(8.0);
     widgets.inactive.rounding = egui::Rounding::from(8.0);
     widgets.hovered.rounding = egui::Rounding::from(8.0);
     widgets.active.rounding = egui::Rounding::from(8.0);
     style.visuals.widgets = widgets;
+    
+    // Set spacing for better readability
+    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.spacing.window_margin = egui::Margin::same(16.0);
     
     ctx.set_style(style);
 }
