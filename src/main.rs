@@ -218,79 +218,170 @@ async fn main() -> Result<(), Box<dyn Error>> {
     
     // Send an initial text message to Gemini
     let mut gemini_guard = gemini_clone.lock().await;
-    if let Err(e) = gemini_guard.send_text("Hello, I'm now streaming audio and screen content to you.").await {
+    if let Err(e) = gemini_guard.send_text("Hello, I'm now streaming audio and screen content to you. I'm an AI assistant that can see and hear what's happening on your computer. How can I help you today?").await {
         error!("Failed to send initial text message: {:?}", e);
     }
     drop(gemini_guard); // Release the lock
     
-    // Audio capture loop
+    // Audio capture setup
     let mut buffer = [0u8; 3200]; // ~100ms of 16 kHz mono S16LE
     let mut is_first_chunk = true;
+    let mut frame_counter = 0;
+    let mut last_successful_frame_time = std::time::Instant::now();
+    let mut consecutive_audio_errors = 0;
+    
+    // Configure screen captures to maintain 2 fps
+    screen.set_capture_interval(Duration::from_millis(500)); // 500ms between frames (2 fps)
+    
+    info!("Starting main capture loop");
     
     loop {
         // Check for stop signal
         if stop_rx.try_recv().is_ok() {
-            info!("Stopping capture loop");
+            info!("Stopping capture loop due to stop signal");
             break;
         }
         
-        // Capture audio
-        if let Err(e) = audio.read(&mut buffer) {
+        // AUDIO CAPTURE AND PROCESSING
+        let audio_result = audio.read(&mut buffer);
+        
+        if let Err(e) = audio_result {
+            consecutive_audio_errors += 1;
             error!("Audio read error: {:?}", e);
-            continue;
-        }
-        
-        // Check if audio is muted in UI
-        let is_audio_muted = if let Ok(state) = ui_state.lock() {
-            state.is_muted
-        } else {
-            false
-        };
-        
-        // Only send audio if not muted
-        if !is_audio_muted {
-            let mut gemini_guard = gemini_clone.lock().await;
-            if let Err(e) = gemini_guard.send_audio(&buffer, is_first_chunk, false).await {
-                error!("Failed to send audio: {:?}", e);
-            }
-            drop(gemini_guard);
-        }
-        is_first_chunk = false;
-        
-        // Capture and send screen frame
-        if let Ok(mut frame) = screen.capture_frame() {
-            let width = frame.width();
-            let height = frame.height();
-            let mime_type = frame.mime_type().to_string();
             
-            // Convert frame to JPEG and send to Gemini
-            match frame.to_jpeg() {
-                Ok(jpeg_data) => {
-                    debug!("Sending screen frame: {}x{} ({} bytes)", 
-                          width, height, jpeg_data.len());
-                    
-                    let mut gemini_guard = gemini_clone.lock().await;
-                    if let Err(e) = gemini_guard.send_video(&jpeg_data, &mime_type).await {
-                        error!("Failed to send video frame: {:?}", e);
+            // If we have too many consecutive errors, take a break
+            if consecutive_audio_errors > 5 {
+                error!("Too many consecutive audio errors, pausing audio capture for 2 seconds");
+                sleep(Duration::from_secs(2)).await;
+                consecutive_audio_errors = 0;
+            }
+            
+            // Continue with video, don't skip the whole loop
+        } else {
+            consecutive_audio_errors = 0; // Reset error counter on success
+            
+            // Check if audio is muted in UI
+            let is_audio_muted = if let Ok(state) = ui_state.lock() {
+                state.is_muted
+            } else {
+                false
+            };
+            
+            // Only send audio if not muted
+            if !is_audio_muted {
+                let mut gemini_guard = gemini_clone.lock().await;
+                
+                if let Err(e) = gemini_guard.send_audio(&buffer, is_first_chunk, false).await {
+                    error!("Failed to send audio: {:?}", e);
+                } else {
+                    // First audio chunk sent successfully
+                    if is_first_chunk {
+                        info!("First audio chunk sent successfully");
+                        is_first_chunk = false;
                     }
-                    drop(gemini_guard);
+                }
+                
+                drop(gemini_guard);
+            }
+        }
+        
+        // VIDEO CAPTURE AND PROCESSING - maintain steady 2 fps
+        frame_counter += 1;
+        
+        // Try to capture a frame on each cycle to maintain 2 fps
+        // The capture_interval in the ScreenCapturer will limit actual captures
+        if true {
+            // Check if we should try to capture a frame
+            let now = std::time::Instant::now();
+            let time_since_last_frame = now.duration_since(last_successful_frame_time);
+            
+            // If it's been too long since our last successful frame, force a capture
+            let frame_result = if time_since_last_frame > Duration::from_secs(6) {
+                debug!("Too long since last frame, forcing capture");
+                screen.force_capture_frame()
+            } else {
+                screen.capture_frame()
+            };
+            
+            match frame_result {
+                Ok(mut frame) => {
+                    let width = frame.width();
+                    let height = frame.height();
+                    let mime_type = frame.mime_type().to_string();
+                    
+                    // Convert frame to JPEG and send to Gemini
+                    match frame.to_jpeg() {
+                        Ok(jpeg_data) => {
+                            debug!("Sending screen frame: {}x{} ({} bytes)", 
+                                  width, height, jpeg_data.len());
+                            
+                            let mut gemini_guard = gemini_clone.lock().await;
+                            if let Err(e) = gemini_guard.send_video(&jpeg_data, &mime_type).await {
+                                error!("Failed to send video frame: {:?}", e);
+                            } else {
+                                // Update last successful frame time
+                                last_successful_frame_time = now;
+                            }
+                            drop(gemini_guard);
+                        },
+                        Err(e) => {
+                            error!("Failed to convert frame to JPEG: {:?}", e);
+                        }
+                    }
                 },
                 Err(e) => {
-                    error!("Failed to convert frame to JPEG: {:?}", e);
+                    // Only log at debug level for timeouts since they're expected
+                    if e.to_string().contains("timeout") {
+                        debug!("Frame capture timeout (normal): {}", e);
+                    } else {
+                        error!("Failed to capture screen frame: {:?}", e);
+                    }
                 }
             }
         }
         
+        // Reduce main loop delay to maintain steady frame rate
+        // Each loop iteration should take about 100ms for proper timing with 500ms capture interval
+        let delay_ms = if consecutive_audio_errors > 0 {
+            // Longer delay if we're having audio issues
+            200
+        } else {
+            // Normal delay - frequent enough to maintain 2 fps with the capture_interval
+            100
+        };
+        
         // Short delay to avoid overwhelming the API
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(delay_ms)).await;
     }
     
     // Send end-of-audio signal before exiting
+    info!("Cleaning up resources and closing connections");
+    
+    // Send a final message to Gemini
     let mut gemini_guard = gemini_clone.lock().await;
+    
+    // First send end-of-audio signal
     if let Err(e) = gemini_guard.send_audio(&[], false, true).await {
         error!("Failed to send end-of-audio signal: {:?}", e);
     }
     
-    info!("rholive assistant stopped");
+    // Then send a proper goodbye message
+    if let Err(e) = gemini_guard.send_text("The application is shutting down now. Thanks for using rholive assistant!").await {
+        error!("Failed to send goodbye message: {:?}", e);
+    }
+    
+    // Small delay to ensure the final messages are sent
+    drop(gemini_guard);
+    sleep(Duration::from_millis(500)).await;
+    
+    // Update UI to indicate shutdown
+    if let Ok(mut state) = ui_state.lock() {
+        state.ai_response = "Application shutting down. Please close this window.".to_string();
+    }
+    
+    // Final sleep to let messages propagate
+    sleep(Duration::from_millis(1000)).await;
+    
+    info!("rholive assistant stopped successfully");
     Ok(())
 }
