@@ -223,6 +223,22 @@ pub struct GenerationConfig {
     pub speech_config: Option<serde_json::Value>,
 }
 
+/// Content structure for system instructions and messages
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Content {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,      // "SYSTEM" | "USER" | "MODEL"
+    pub parts: Vec<Part>,
+}
+
+/// Part of a content message
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct Part {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
 /// Session setup message.
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -231,7 +247,7 @@ pub struct BidiGenerateContentSetup {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<GenerationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_instruction: Option<String>,
+    pub system_instruction: Option<Content>,  // Changed from String to Content
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -425,7 +441,7 @@ pub enum ResponseModality {
 }
 
 impl ResponseModality {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Text => "TEXT",
             Self::Audio => "AUDIO",
@@ -442,7 +458,7 @@ pub enum MediaResolution {
 }
 
 impl MediaResolution {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Low => "MEDIA_RESOLUTION_LOW",
             Self::Medium => "MEDIA_RESOLUTION_MEDIUM",
@@ -510,8 +526,17 @@ impl GeminiClient {
         self.state = ConnectionState::Connecting;
         info!("Connecting to Gemini API at {}", self.config.url);
         
-        let (ws, _resp) = connect_async(&self.config.url).await
-            .map_err(GeminiError::WebSocket)?;
+        // Add a brief delay to ensure connection has time to initialize
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        let connect_result = connect_async(&self.config.url).await;
+        if let Err(e) = connect_result {
+            error!("Failed to connect to Gemini API: {:?}", e);
+            return Err(GeminiError::WebSocket(e));
+        }
+        
+        let (ws, resp) = connect_result.unwrap();
+        debug!("WebSocket connection response: {:?}", resp);
         
         self.ws = Some(ws);
         self.state = ConnectionState::Connected;
@@ -520,16 +545,21 @@ impl GeminiClient {
         // Start the message processing loop
         self.start_message_processing();
         
+        // Add another brief delay to allow the WebSocket to fully establish
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
         Ok(())
     }
     
     /// Initialize a session by sending the setup message.
     pub async fn setup(&mut self) -> Result<()> {
         if self.state == ConnectionState::Disconnected {
+            error!("Cannot setup session: Connection is closed");
             return Err(GeminiError::ConnectionClosed);
         }
         
         if self.state == ConnectionState::SetupComplete {
+            info!("Session already set up");
             return Ok(());
         }
         
@@ -538,7 +568,14 @@ impl GeminiClient {
         // Create the setup message
         let mut setup = BidiGenerateContentSetup {
             model: self.config.model.clone(),
-            system_instruction: self.config.system_instruction.clone(),
+            system_instruction: self.config.system_instruction.clone().map(|instruction| {
+                Content {
+                    role: Some("SYSTEM".to_string()),
+                    parts: vec![Part {
+                        text: Some(instruction),
+                    }],
+                }
+            }),
             ..Default::default()
         };
         
@@ -565,17 +602,37 @@ impl GeminiClient {
             }));
         }
         
+        info!("Sending setup message with model: {}", setup.model);
+        
+        // Make sure we're connected to the WebSocket
+        if self.ws.is_none() {
+            error!("WebSocket connection is not initialized");
+            return Err(GeminiError::ConnectionClosed);
+        }
+        
         // Send the setup message
         let msg = ClientMessage::Setup { setup };
-        self.send(&msg).await?;
+        if let Err(e) = self.send(&msg).await {
+            error!("Failed to send setup message: {:?}", e);
+            return Err(e);
+        }
         
-        // Wait for setup complete response
-        let timeout = tokio::time::timeout(
+        info!("Setup message sent, waiting for acknowledgment");
+        
+        // Wait for setup complete response with a timeout
+        let setup_wait_result = tokio::time::timeout(
             Duration::from_secs(10),
             self.wait_for_setup_complete()
-        ).await.map_err(|_| GeminiError::Timeout)?;
+        ).await;
         
-        if timeout {
+        if let Err(_) = setup_wait_result {
+            error!("Timeout waiting for setup complete message");
+            return Err(GeminiError::Timeout);
+        }
+        
+        let setup_completed = setup_wait_result.unwrap();
+        
+        if setup_completed {
             self.state = ConnectionState::SetupComplete;
             info!("Gemini session setup complete");
             Ok(())
@@ -608,13 +665,29 @@ impl GeminiClient {
     
     /// Start the message processing loop in a background task.
     fn start_message_processing(&mut self) {
+        // The fundamental issue here is that we're trying to use a single WebSocket from two places:
+        // 1. The message processing loop reads from it
+        // 2. The send() method writes to it
+        
+        // For now, let's simplify the design - we'll give the WebSocket to the background task
+        // and rely on the response channel for communication instead of trying to share it
+        
         if let Some(ws) = self.ws.take() {
-            let ws = Arc::new(Mutex::new(ws));
+            let ws_arc = Arc::new(Mutex::new(ws));
             let response_tx = self.response_tx.clone();
             
+            info!("Starting message processing loop");
+            
             tokio::spawn(async move {
-                Self::process_messages(ws, response_tx).await;
+                info!("Message processing task started");
+                Self::process_messages(ws_arc, response_tx).await;
+                info!("Message processing task terminated");
             });
+            
+            // The WebSocket is now managed by the background task
+            // We'll need to redesign how messages are sent
+        } else {
+            error!("Failed to start message processing: WebSocket not initialized");
         }
     }
     
@@ -623,23 +696,45 @@ impl GeminiClient {
         ws: Arc<Mutex<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>,
         response_tx: mpsc::Sender<Result<ApiResponse>>,
     ) {
+        // Set a timeout for WebSocket initial receive
+        let timeout_duration = Duration::from_secs(5);
+        
         loop {
-            let message = {
+            info!("Waiting for next WebSocket message");
+            
+            let message_result = {
                 let mut ws_guard = ws.lock().await;
-                match ws_guard.next().await {
-                    Some(Ok(msg)) => msg,
-                    Some(Err(e)) => {
-                        if let Err(_) = response_tx.send(Err(GeminiError::WebSocket(e))).await {
-                            error!("Failed to send error to response channel");
-                        }
-                        break;
+                
+                // Use timeout for the next message
+                match tokio::time::timeout(timeout_duration, ws_guard.next()).await {
+                    Ok(Some(Ok(msg))) => Ok(msg),
+                    Ok(Some(Err(e))) => {
+                        error!("WebSocket error: {:?}", e);
+                        Err(GeminiError::WebSocket(e))
+                    },
+                    Ok(None) => {
+                        error!("WebSocket stream ended unexpectedly");
+                        Err(GeminiError::ConnectionClosed)
+                    },
+                    Err(_) => {
+                        error!("Timeout waiting for WebSocket message");
+                        Err(GeminiError::Timeout)
                     }
-                    None => {
-                        if let Err(_) = response_tx.send(Err(GeminiError::ConnectionClosed)).await {
-                            error!("Failed to send connection closed error");
-                        }
-                        break;
+                }
+            };
+            
+            let message = match message_result {
+                Ok(msg) => {
+                    // Process the message
+                    info!("Received WebSocket message: {:?}", msg);
+                    msg
+                },
+                Err(e) => {
+                    error!("Failed to receive message: {:?}", e);
+                    if let Err(_) = response_tx.send(Err(e)).await {
+                        error!("Failed to send error to response channel");
                     }
+                    break;
                 }
             };
             
@@ -671,9 +766,16 @@ impl GeminiClient {
     
     /// Handle a text message from the WebSocket.
     async fn handle_text_message(text: &str, response_tx: &mpsc::Sender<Result<ApiResponse>>) -> Result<()> {
-        let server_message = serde_json::from_str::<ServerMessage>(text)
-            .map_err(GeminiError::Serialization)?;
-            
+        debug!("Parsing text message: {}", text);
+        let parse_result = serde_json::from_str::<ServerMessage>(text);
+        
+        if let Err(e) = parse_result {
+            error!("Failed to parse server message: {:?}", e);
+            error!("Raw message: {}", text);
+            return Err(GeminiError::Serialization(e));
+        }
+        
+        let server_message = parse_result.unwrap();
         match server_message {
             ServerMessage::SetupComplete { .. } => {
                 response_tx.send(Ok(ApiResponse::SetupComplete)).await
@@ -803,12 +905,21 @@ impl GeminiClient {
             },
         };
         
-        debug!("Sending message: {}", json);
+        info!("Sending message: {}", json);
         
         if let Some(ws) = &mut self.ws {
-            ws.send(Message::text(json)).await.map_err(GeminiError::WebSocket)?;
-            Ok(())
+            match ws.send(Message::text(json.clone())).await {
+                Ok(_) => {
+                    info!("Message sent successfully");
+                    Ok(())
+                },
+                Err(e) => {
+                    error!("Failed to send message: {:?}", e);
+                    Err(GeminiError::WebSocket(e))
+                }
+            }
         } else {
+            error!("WebSocket connection closed or not established");
             Err(GeminiError::ConnectionClosed)
         }
     }

@@ -1,16 +1,10 @@
-#[cfg(feature = "capture")]
 use xcap::{Monitor, VideoRecorder, Frame};
-#[cfg(feature = "capture")]
 use std::error::Error;
-#[cfg(feature = "capture")]
 use std::sync::mpsc::Receiver;
-#[cfg(feature = "capture")]
 use std::time::Duration;
-#[cfg(feature = "capture")]
-use tracing::{info, warn, error};
+use tracing::info;
 
 /// Represents a captured screen frame with conversion options.
-#[cfg(feature = "capture")]
 #[derive(Debug)]
 pub struct CapturedFrame {
     /// The raw frame data from XCap
@@ -19,7 +13,6 @@ pub struct CapturedFrame {
     jpeg_data: Option<Vec<u8>>,
 }
 
-#[cfg(feature = "capture")]
 impl CapturedFrame {
     /// Create a new CapturedFrame from an XCap Frame
     pub fn new(frame: Frame) -> Self {
@@ -73,7 +66,6 @@ impl CapturedFrame {
 }
 
 /// Captures frames from the primary monitor using the `xcap` crate.
-#[cfg(feature = "capture")]
 pub struct ScreenCapturer {
     video_recorder: VideoRecorder,
     frame_rx: Receiver<Frame>,
@@ -82,16 +74,14 @@ pub struct ScreenCapturer {
     monitor_info: MonitorInfo,
 }
 
-#[cfg(feature = "capture")]
 #[derive(Debug, Clone)]
-struct MonitorInfo {
+pub struct MonitorInfo {
     name: String,
     width: u32,
     height: u32,
     is_primary: bool,
 }
 
-#[cfg(feature = "capture")]
 impl ScreenCapturer {
     /// Create a new screen capturer for the primary monitor with default options.
     pub fn new() -> Result<Self, Box<dyn Error>> {
@@ -166,16 +156,3 @@ impl ScreenCapturer {
     }
 }
 
-#[cfg(not(feature = "capture"))]
-pub struct ScreenCapturer;
-
-#[cfg(not(feature = "capture"))]
-impl ScreenCapturer {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Err("screen capture feature not enabled".into())
-    }
-
-    pub fn capture_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        Err("screen capture feature not enabled".into())
-    }
-}
