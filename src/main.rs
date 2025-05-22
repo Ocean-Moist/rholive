@@ -415,14 +415,16 @@ async fn async_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         None
     };
 
-    // Create segmenter configuration with more aggressive Whisper settings
+    // Create segmenter configuration with the clean-sheet design parameters
     let seg_config = SegConfig {
-        open_voiced_frames: 4,    // 80ms of speech to open (more responsive)
-        close_silence_ms: 300,    // 300ms silence to close (faster turn completion)
-        max_turn_ms: 5000,        // 5 seconds max turn (shorter turns)
-        whisper_gate: true,       // Use semantic gating
-        clause_tokens: 8,         // 8 tokens is roughly a short phrase (more frequent triggers)
-        whisper_interval_ms: 300, // Run Whisper every 300ms (more frequent analysis)
+        open_voiced_frames: 6, // 120ms of speech to open (more responsive)
+        close_silence_ms: 300, // 300ms silence to close (faster turn completion)
+        max_turn_ms: 5000,     // 5 seconds max turn (shorter turns)
+        min_clause_tokens: 8,  // 8 tokens is roughly a short phrase
+        asr_poll_ms: 300,  // Run Whisper every 300ms (more frequent analysis)
+        ring_capacity: 320_000, // 20 seconds buffer
+        asr_pool_size: 2,      // 2 worker threads
+        asr_timeout_ms: 2000,  // 2 second timeout
     };
 
     // Create the segmenter
@@ -533,12 +535,12 @@ async fn async_main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     if let Some(turn) = segmenter_guard.push_chunk(&local_buffer) {
                         debug!(
                             "Segmenter produced a turn: {} samples, reason: {:?}",
-                            turn.pcm.len(),
+                            turn.audio.len(),
                             turn.close_reason
                         );
 
                         // If we have partial text, log it
-                        if let Some(text) = &turn.partial_text {
+                        if let Some(text) = &turn.text {
                             info!("Segmenter transcription: {}", text);
                         }
 

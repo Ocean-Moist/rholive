@@ -19,6 +19,15 @@ path = "src/bin/audio_test.rs"
 name = "audio_device_test"
 path = "src/bin/audio_device_test.rs"
 
+[[bin]]
+name = "test_wav"
+path = "src/bin/test_wav.rs"
+
+[[bin]]
+name = "test_wav_v2"
+path = "src/bin/test_wav_v2.rs"
+
+
 
 [dependencies]
 xcap = { version = "0.6.0", features = ["image"] }
