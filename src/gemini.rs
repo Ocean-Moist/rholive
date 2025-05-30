@@ -74,22 +74,34 @@ pub struct RealtimeInput {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RealtimeAudio {
     pub data: String,
+    #[serde(rename = "mimeType")]
     pub mime_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RealtimeVideo {
     pub data: String,
+    #[serde(rename = "mimeType")]
     pub mime_type: String,
 }
 
 /// Message sent from client to server.
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
 pub enum ClientMessage {
     Setup { setup: BidiGenerateContentSetup },
-    ClientContent { client_content: serde_json::Value },
-    RealtimeInput { realtime_input: RealtimeInput },
-    ToolResponse { tool_response: serde_json::Value },
+    ClientContent { 
+        #[serde(rename = "clientContent")]
+        client_content: serde_json::Value 
+    },
+    RealtimeInput { 
+        #[serde(rename = "realtimeInput")]
+        realtime_input: RealtimeInput 
+    },
+    ToolResponse { 
+        #[serde(rename = "toolResponse")]
+        tool_response: serde_json::Value 
+    },
 }
 
 /// Server -> client messages

@@ -295,3 +295,22 @@ impl ScreenCapturer {
         &self.monitor_info
     }
 }
+
+/// Public function to calculate a quick hash for a frame
+pub fn quick_hash(frame: &Frame) -> u64 {
+    let mut hasher = DefaultHasher::new();
+
+    // Sample the frame data for faster hashing
+    let data = &frame.raw;
+    let step = data.len() / 64; // Sample 64 points
+
+    for i in (0..data.len()).step_by(step.max(1)) {
+        data[i].hash(&mut hasher);
+    }
+
+    // Also hash the dimensions
+    frame.width.hash(&mut hasher);
+    frame.height.hash(&mut hasher);
+
+    hasher.finish()
+}

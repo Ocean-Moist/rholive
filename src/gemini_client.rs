@@ -849,6 +849,54 @@ impl GeminiClient {
             ConnectionState::SetupComplete => "SetupComplete",
         }
     }
+
+    /// Send raw realtime input JSON (for channel-based architecture)
+    pub async fn send_realtime_input(&mut self, json: serde_json::Value) -> Result<()> {
+        if self.state != ConnectionState::SetupComplete {
+            return Err(GeminiError::SetupNotComplete);
+        }
+
+        // Parse the JSON value as RealtimeInput
+        let realtime_input: RealtimeInput = serde_json::from_value(json)?;
+        let message = ClientMessage::RealtimeInput { realtime_input };
+        let json_str = serde_json::to_string(&message)?;
+
+        if let Some(ref writer) = self.ws_writer {
+            writer
+                .lock()
+                .await
+                .send(Message::Text(json_str.into()))
+                .await
+                .map_err(|e| GeminiError::WebSocket(e))?;
+        } else {
+            return Err(GeminiError::ConnectionClosed);
+        }
+
+        Ok(())
+    }
+
+    /// Send raw client content JSON (for channel-based architecture)
+    pub async fn send_client_content(&mut self, json: serde_json::Value) -> Result<()> {
+        if self.state != ConnectionState::SetupComplete {
+            return Err(GeminiError::SetupNotComplete);
+        }
+
+        let message = ClientMessage::ClientContent { client_content: json };
+        let json_str = serde_json::to_string(&message)?;
+
+        if let Some(ref writer) = self.ws_writer {
+            writer
+                .lock()
+                .await
+                .send(Message::Text(json_str.into()))
+                .await
+                .map_err(|e| GeminiError::WebSocket(e))?;
+        } else {
+            return Err(GeminiError::ConnectionClosed);
+        }
+
+        Ok(())
+    }
 }
 
 /// Process server content messages which can contain different types of data.
