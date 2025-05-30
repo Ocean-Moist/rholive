@@ -595,11 +595,13 @@ fn is_valid_clause_simple(text: &str, min_tokens: usize) -> bool {
         return true;
     }
 
-    // Disfluencies
-    matches!(t.chars().last().unwrap_or(' '), ',' | '-')
-        || t.ends_with(" and")
-        || t.ends_with(" but")
-        || t.contains(" because ")
+    false
+
+    // // Disfluencies
+    // matches!(t.chars().last().unwrap_or(' '), ',' | '-')
+    //     || t.ends_with(" and")
+    //     || t.ends_with(" but")
+    //     || t.contains(" because ")
 }
 
 /// Segment emitter that converts commits to final segments
@@ -705,6 +707,8 @@ pub struct AudioSegmenter {
     emitter: SegmentEmitter,
     last_asr_poll: Instant,
     next_asr_id: u64,
+    /// Track the last index submitted to ASR to avoid duplicate processing
+    last_asr_submit_idx: Option<usize>,
 }
 
 impl AudioSegmenter {
@@ -734,6 +738,7 @@ impl AudioSegmenter {
             emitter,
             last_asr_poll: Instant::now(),
             next_asr_id: 1,
+            last_asr_submit_idx: None,
         })
     }
 
@@ -784,15 +789,33 @@ impl AudioSegmenter {
             let poll_end = current_idx;
             let poll_start = seg_range.start;
             
-            // Only poll if we have enough audio (at least 1 second)
-            if poll_end > poll_start + 16000 {
+            // Check if this is a new segment (segment boundary changed)
+            let is_new_segment = self.last_asr_submit_idx
+                .map(|last_idx| last_idx < poll_start)
+                .unwrap_or(true);
+            
+            if is_new_segment {
+                // Reset tracking for new segment
+                self.last_asr_submit_idx = Some(poll_start);
+            }
+            
+            // Only submit new audio that hasn't been processed yet
+            let actual_start = self.last_asr_submit_idx.unwrap_or(poll_start);
+            
+            // Only poll if we have enough NEW audio (at least 0.5 seconds of new data)
+            if poll_end > actual_start + 8000 {
                 if let Some(audio) = self.ring_buffer.get_range(poll_start..poll_end) {
                     let submitted = self.asr_pool.submit(self.next_asr_id, audio, poll_start..poll_end);
                     if submitted {
-                        debug!("Submitted ASR request {} for range {}..{}", self.next_asr_id, poll_start, poll_end);
+                        debug!("Submitted ASR request {} for range {}..{} (full segment)", self.next_asr_id, poll_start, poll_end);
+                        // Update tracking to avoid reprocessing
+                        self.last_asr_submit_idx = Some(poll_end);
                     }
                 }
             }
+        } else {
+            // No active segment, reset tracking
+            self.last_asr_submit_idx = None;
         }
     }
 
@@ -814,7 +837,7 @@ pub fn i16_to_u8_mut(buffer: &mut [i16]) -> &mut [u8] {
 }
 
 /// Convert i16 slice to u8 slice
-fn i16_slice_to_u8(slice: &[i16]) -> &[u8] {
+pub fn i16_slice_to_u8(slice: &[i16]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(
             slice.as_ptr() as *const u8,

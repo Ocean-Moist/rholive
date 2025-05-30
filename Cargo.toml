@@ -24,8 +24,9 @@ name = "test_wav"
 path = "src/bin/test_wav.rs"
 
 [[bin]]
-name = "test_wav_v2"
-path = "src/bin/test_wav_v2.rs"
+name = "test_async_audio"
+path = "src/bin/test_async_audio.rs"
+
 
 
 

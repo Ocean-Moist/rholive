@@ -1,10 +1,37 @@
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use xcap::{Frame, Monitor, VideoRecorder};
+
+/// Screen capture error that is Send + Sync
+#[derive(Debug)]
+pub enum ScreenError {
+    XcapError(String),
+    NoMonitors,
+    FrameConversionError(String),
+    Other(String),
+}
+
+impl fmt::Display for ScreenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScreenError::XcapError(e) => write!(f, "Xcap error: {}", e),
+            ScreenError::NoMonitors => write!(f, "No monitors found"),
+            ScreenError::FrameConversionError(e) => write!(f, "Frame conversion error: {}", e),
+            ScreenError::Other(e) => write!(f, "Screen capture error: {}", e),
+        }
+    }
+}
+
+impl Error for ScreenError {}
+
+// Make it Send + Sync
+unsafe impl Send for ScreenError {}
+unsafe impl Sync for ScreenError {}
 
 /// Represents a captured screen frame with conversion options.
 #[derive(Debug)]
@@ -25,7 +52,7 @@ impl CapturedFrame {
     }
 
     /// Convert the frame to JPEG format for sending to the Gemini API
-    pub fn to_jpeg(&mut self) -> Result<&[u8], Box<dyn Error>> {
+    pub fn to_jpeg(&mut self) -> Result<&[u8], ScreenError> {
         if self.jpeg_data.is_none() {
             // Convert the raw RGBA buffer to JPEG
             let width = self.frame.width;
@@ -33,7 +60,7 @@ impl CapturedFrame {
 
             // Create an RgbaImage from the raw data
             let rgba_image = image::RgbaImage::from_raw(width, height, self.frame.raw.clone())
-                .ok_or_else(|| "Failed to create image from raw data".to_string())?;
+                .ok_or_else(|| ScreenError::FrameConversionError("Failed to create image from raw data".to_string()))?;
 
             // First convert RGBA to RGB by dropping the alpha channel
             let rgb_image = image::DynamicImage::ImageRgba8(rgba_image).into_rgb8();
@@ -42,7 +69,8 @@ impl CapturedFrame {
             let mut jpeg_buffer = Vec::new();
             let mut encoder =
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buffer, 75);
-            encoder.encode(&rgb_image, width, height, image::ExtendedColorType::Rgb8)?;
+            encoder.encode(&rgb_image, width, height, image::ExtendedColorType::Rgb8)
+                .map_err(|e| ScreenError::FrameConversionError(e.to_string()))?;
 
             self.jpeg_data = Some(jpeg_buffer);
         }
@@ -63,6 +91,26 @@ impl CapturedFrame {
     /// Get the height of the frame
     pub fn height(&self) -> u32 {
         self.frame.height
+    }
+    
+    /// Calculate a hash of the frame for duplicate detection
+    pub fn hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut hasher = DefaultHasher::new();
+        
+        // Hash a subset of pixels for efficiency
+        let step = (self.frame.raw.len() / 1000).max(1);
+        for i in (0..self.frame.raw.len()).step_by(step) {
+            self.frame.raw[i].hash(&mut hasher);
+        }
+        
+        // Include dimensions in hash
+        self.frame.width.hash(&mut hasher);
+        self.frame.height.hash(&mut hasher);
+        
+        hasher.finish()
     }
 }
 
@@ -87,16 +135,17 @@ pub struct MonitorInfo {
 
 impl ScreenCapturer {
     /// Create a new screen capturer for the primary monitor with default options.
-    pub fn new() -> Result<Self, Box<dyn Error>> {
+    pub fn new() -> Result<Self, ScreenError> {
         Self::with_options(Duration::from_millis(500))
     }
 
     /// Create a new screen capturer for the primary monitor with specified capture interval.
-    pub fn with_options(capture_interval: Duration) -> Result<Self, Box<dyn Error>> {
+    pub fn with_options(capture_interval: Duration) -> Result<Self, ScreenError> {
         // Get all monitors and use the first one
-        let monitors = Monitor::all()?;
+        let monitors = Monitor::all()
+            .map_err(|e| ScreenError::XcapError(e.to_string()))?;
         if monitors.is_empty() {
-            return Err("No monitors found".into());
+            return Err(ScreenError::NoMonitors);
         }
 
         // Find primary monitor if available
@@ -119,8 +168,10 @@ impl ScreenCapturer {
             monitor_info.name, monitor_info.width, monitor_info.height, monitor_info.is_primary
         );
 
-        let (video_recorder, frame_rx) = monitor.video_recorder()?;
-        video_recorder.start()?;
+        let (video_recorder, frame_rx) = monitor.video_recorder()
+            .map_err(|e| ScreenError::XcapError(e.to_string()))?;
+        video_recorder.start()
+            .map_err(|e| ScreenError::XcapError(e.to_string()))?;
 
         Ok(Self {
             video_recorder,
@@ -156,13 +207,13 @@ impl ScreenCapturer {
 
     /// Capture a single frame of the screen.
     /// This method respects the configured capture interval.
-    pub fn capture_frame(&mut self) -> Result<CapturedFrame, Box<dyn Error>> {
+    pub fn capture_frame(&mut self) -> Result<CapturedFrame, ScreenError> {
         let now = std::time::Instant::now();
 
         // Check if we need to throttle frame captures
         if now.duration_since(self.last_capture) < self.capture_interval {
             debug!("Capture interval not reached, throttling capture");
-            return Err("Capture interval not reached".into());
+            return Err(ScreenError::Other("Capture interval not reached".to_string()));
         }
 
         // Try to receive a frame with timeout
@@ -178,7 +229,7 @@ impl ScreenCapturer {
                 if let Some(last_hash) = self.last_frame_hash {
                     if frame_hash == last_hash {
                         warn!("Duplicate frame detected, skipping");
-                        return Err("Duplicate frame".into());
+                        return Err(ScreenError::Other("Duplicate frame".to_string()));
                     }
                 }
 
@@ -192,17 +243,17 @@ impl ScreenCapturer {
                 // Log the error but don't propagate timeout errors as they're expected
                 if let std::sync::mpsc::RecvTimeoutError::Timeout = e {
                     debug!("Timed out waiting for screen frame, this is normal");
-                    Err("Frame capture timeout".into())
+                    Err(ScreenError::Other("Frame capture timeout".to_string()))
                 } else {
                     tracing::error!("Error receiving frame from xcap: {:?}", e);
-                    Err(Box::new(e))
+                    Err(ScreenError::Other(format!("Receive error: {:?}", e)))
                 }
             }
         }
     }
 
     /// Force a frame capture regardless of interval
-    pub fn force_capture_frame(&mut self) -> Result<CapturedFrame, Box<dyn Error>> {
+    pub fn force_capture_frame(&mut self) -> Result<CapturedFrame, ScreenError> {
         // Reset the last capture time
         self.last_capture =
             std::time::Instant::now() - self.capture_interval - Duration::from_millis(1);
@@ -225,10 +276,10 @@ impl ScreenCapturer {
                 // Log the error but don't propagate timeout errors as they're expected
                 if let std::sync::mpsc::RecvTimeoutError::Timeout = e {
                     debug!("Timed out waiting for forced screen frame");
-                    Err("Frame capture timeout".into())
+                    Err(ScreenError::Other("Frame capture timeout".to_string()))
                 } else {
                     tracing::error!("Error receiving forced frame from xcap: {:?}", e);
-                    Err(Box::new(e))
+                    Err(ScreenError::Other(format!("Receive error: {:?}", e)))
                 }
             }
         }

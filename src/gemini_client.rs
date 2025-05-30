@@ -475,6 +475,12 @@ impl GeminiClient {
             serde_json::json!("START_OF_ACTIVITY_INTERRUPTS"),
         );
 
+        // Set turnCoverage to include all input (not just within activity markers)
+        config_map.insert(
+            "turnCoverage".to_string(),
+            serde_json::json!("TURN_INCLUDES_ONLY_ACTIVITY"),
+        );
+
         setup.realtime_input_config = Some(realtime_config);
 
         info!("Sending setup message with model: {}", setup.model);

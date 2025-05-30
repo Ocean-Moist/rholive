@@ -1,0 +1,3651 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: src/main.rs, src/screen.rs, src/audio_async.rs, src/gemini_client.rs, GEMINI_LIVE_API.md
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+
+Additional Info:
+----------------
+
+================================================================
+Directory Structure
+================================================================
+src/
+  audio_async.rs
+  gemini_client.rs
+  main.rs
+  screen.rs
+GEMINI_LIVE_API.md
+
+================================================================
+Files
+================================================================
+
+================
+File: src/audio_async.rs
+================
+//! Async audio capture module using PulseAudio's threaded mainloop
+//! 
+//! This provides proper async integration with tokio by using PulseAudio's
+//! threaded mainloop and callback-based API.
+
+use libpulse_binding as pulse;
+use pulse::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
+use pulse::mainloop::threaded::Mainloop;
+use pulse::proplist::Proplist;
+use pulse::sample::{Format, Spec};
+use pulse::stream::{FlagSet as StreamFlagSet, State as StreamState, Stream};
+use std::cell::RefCell;
+use std::error::Error;
+use std::ops::Deref;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{error, info};
+
+/// Async audio capturer using PulseAudio's threaded mainloop
+pub struct AsyncAudioCapturer {
+    /// Channel for receiving audio chunks
+    rx: mpsc::Receiver<Vec<i16>>,
+    /// Shutdown flag
+    shutdown: Arc<AtomicBool>,
+    /// Handle to the background thread
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl AsyncAudioCapturer {
+    /// Create a new async audio capturer
+    pub fn new(app_name: &str, device_name: Option<&str>) -> Result<Self, Box<dyn Error>> {
+        let (tx, rx) = mpsc::channel::<Vec<i16>>(32);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        
+        let app_name = app_name.to_string();
+        let device_name = device_name.map(|s| s.to_string());
+        
+        // Spawn the audio capture thread (not a tokio task, a real OS thread)
+        let handle = std::thread::spawn(move || {
+            if let Err(e) = run_audio_capture(app_name, device_name, tx, shutdown_clone) {
+                error!("Audio capture error: {}", e);
+            }
+        });
+        
+        Ok(Self {
+            rx,
+            shutdown,
+            _handle: handle,
+        })
+    }
+    
+    /// Read the next chunk of audio data (100ms worth)
+    /// Returns None if the capture has ended
+    pub async fn read_chunk(&mut self) -> Option<Vec<i16>> {
+        self.rx.recv().await
+    }
+    
+    /// Get the device name being used
+    pub fn device_name(&self) -> &str {
+        "pulse" // TODO: track actual device name
+    }
+}
+
+impl Drop for AsyncAudioCapturer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Thread will exit when it sees shutdown flag
+    }
+}
+
+/// Run the audio capture in a dedicated thread with PulseAudio's threaded mainloop
+fn run_audio_capture(
+    app_name: String,
+    device_name: Option<String>,
+    tx: mpsc::Sender<Vec<i16>>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error>> {
+    // Create the mainloop
+    let mainloop = Rc::new(RefCell::new(
+        Mainloop::new().ok_or("Failed to create mainloop")?
+    ));
+    
+    // Create property list for the application
+    let mut proplist = Proplist::new().ok_or("Failed to create proplist")?;
+    proplist.set_str(pulse::proplist::properties::APPLICATION_NAME, &app_name)
+        .map_err(|()| "Failed to set application name")?;
+    
+    // Create context
+    let context = Rc::new(RefCell::new(
+        Context::new_with_proplist(
+            mainloop.borrow().deref(),
+            "AudioContext",
+            &proplist
+        ).ok_or("Failed to create context")?
+    ));
+    
+    // Set state callback to know when we're connected
+    let ml_ref = mainloop.clone();
+    let context_ref = context.clone();
+    context.borrow_mut().set_state_callback(Some(Box::new(move || {
+        let state = unsafe { (*context_ref.as_ptr()).get_state() };
+        match state {
+            ContextState::Ready => {
+                let ml = unsafe { &mut *ml_ref.as_ptr() };
+                ml.signal(false);
+            }
+            ContextState::Failed | ContextState::Terminated => {
+                let ml = unsafe { &mut *ml_ref.as_ptr() };
+                ml.signal(false);
+            }
+            _ => {}
+        }
+    })));
+    
+    // Connect the context
+    mainloop.borrow_mut().lock();
+    context.borrow_mut().connect(None, ContextFlagSet::NOFLAGS, None)
+        .map_err(|e| format!("Failed to connect context: {:?}", e))?;
+    mainloop.borrow_mut().unlock();
+    
+    // Start the mainloop
+    mainloop.borrow_mut().start()
+        .map_err(|e| format!("Failed to start mainloop: {:?}", e))?;
+    
+    // Wait for context to be ready
+    mainloop.borrow_mut().lock();
+    loop {
+        match context.borrow().get_state() {
+            ContextState::Ready => break,
+            ContextState::Failed | ContextState::Terminated => {
+                mainloop.borrow_mut().unlock();
+                mainloop.borrow_mut().stop();
+                return Err("Context connection failed".into());
+            }
+            _ => {
+                mainloop.borrow_mut().wait();
+            }
+        }
+    }
+    mainloop.borrow_mut().unlock();
+    
+    info!("PulseAudio context connected");
+    
+    // Create the recording stream - 16kHz mono S16LE
+    let spec = Spec {
+        format: Format::S16le,
+        channels: 1,
+        rate: 16000,
+    };
+    
+    let stream = Rc::new(RefCell::new(
+        Stream::new(
+            &mut context.borrow_mut(),
+            "AudioStream",
+            &spec,
+            None
+        ).ok_or("Failed to create stream")?
+    ));
+    
+    // Buffer for accumulating samples
+    let buffer = Rc::new(RefCell::new(Vec::<i16>::with_capacity(1600)));
+    
+    // Set up the read callback
+    let tx_clone = tx.clone();
+    let ml_ref = mainloop.clone();
+    let stream_ref = stream.clone();
+    let buffer_ref = buffer.clone();
+    let shutdown_ref = shutdown.clone();
+    
+    stream.borrow_mut().set_read_callback(Some(Box::new(move |length| {
+        if length == 0 {
+            return;
+        }
+        
+        // Check for shutdown
+        if shutdown_ref.load(Ordering::Relaxed) {
+            unsafe {
+                let ml = &mut *ml_ref.as_ptr();
+                ml.stop();
+            }
+            return;
+        }
+        
+        // Peek at the data
+        let peek_result = unsafe {
+            let stream = &mut *stream_ref.as_ptr();
+            stream.peek()
+        };
+        
+        match peek_result {
+            Ok(pulse::stream::PeekResult::Data(data)) => {
+                if !data.is_empty() {
+                    // Convert bytes to i16 samples
+                    let samples: Vec<i16> = data.chunks_exact(2)
+                        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                        .collect();
+                    
+                    // Accumulate in buffer
+                    unsafe {
+                        let buffer = &mut *buffer_ref.as_ptr();
+                        buffer.extend_from_slice(&samples);
+                        
+                        // Send complete 100ms chunks (1600 samples)
+                        while buffer.len() >= 1600 {
+                            let chunk: Vec<i16> = buffer.drain(..1600).collect();
+                            // Use blocking send since we're in a thread
+                            if tx_clone.blocking_send(chunk).is_err() {
+                                // Receiver dropped, initiate shutdown
+                                let ml = &mut *ml_ref.as_ptr();
+                                ml.stop();
+                                return;
+                            }
+                        }
+                    }
+                    
+                    // Discard the data from the stream
+                    unsafe {
+                        let stream = &mut *stream_ref.as_ptr();
+                        let _ = stream.discard();
+                    }
+                }
+            }
+            Ok(pulse::stream::PeekResult::Empty) => {
+                // No data available
+            }
+            Ok(pulse::stream::PeekResult::Hole(_)) => {
+                // There's a hole in the buffer, skip it
+                unsafe {
+                    let stream = &mut *stream_ref.as_ptr();
+                    let _ = stream.discard();
+                }
+            }
+            Err(e) => {
+                error!("Failed to peek stream data: {:?}", e);
+            }
+        }
+    })));
+    
+    // Set stream state callback
+    let ml_ref = mainloop.clone();
+    let stream_ref = stream.clone();
+    stream.borrow_mut().set_state_callback(Some(Box::new(move || {
+        let state = unsafe {
+            let stream = &*stream_ref.as_ptr();
+            stream.get_state()
+        };
+        match state {
+            StreamState::Ready => {
+                info!("Stream ready");
+                unsafe {
+                    let ml = &mut *ml_ref.as_ptr();
+                    ml.signal(false);
+                }
+            }
+            StreamState::Failed | StreamState::Terminated => {
+                error!("Stream failed/terminated");
+                unsafe {
+                    let ml = &mut *ml_ref.as_ptr();
+                    ml.signal(false);
+                }
+            }
+            _ => {}
+        }
+    })));
+    
+    // Set buffer attributes for low latency
+    let buffer_attr = pulse::def::BufferAttr {
+        maxlength: 16000, // 1 second max
+        tlength: std::u32::MAX,
+        prebuf: std::u32::MAX,
+        minreq: std::u32::MAX,
+        fragsize: 3200, // 100ms chunks (1600 samples * 2 bytes)
+    };
+    
+    // Connect the stream for recording
+    mainloop.borrow_mut().lock();
+    stream.borrow_mut().connect_record(
+        device_name.as_deref(),
+        Some(&buffer_attr),
+        StreamFlagSet::ADJUST_LATENCY | StreamFlagSet::AUTO_TIMING_UPDATE
+    ).map_err(|e| format!("Failed to connect recording stream: {:?}", e))?;
+    mainloop.borrow_mut().unlock();
+    
+    // Wait for stream to be ready
+    mainloop.borrow_mut().lock();
+    loop {
+        match stream.borrow().get_state() {
+            StreamState::Ready => break,
+            StreamState::Failed | StreamState::Terminated => {
+                mainloop.borrow_mut().unlock();
+                mainloop.borrow_mut().stop();
+                return Err("Stream connection failed".into());
+            }
+            _ => {
+                mainloop.borrow_mut().wait();
+            }
+        }
+    }
+    mainloop.borrow_mut().unlock();
+    
+    info!("Audio stream ready, starting capture");
+    
+    // The threaded mainloop runs in its own thread
+    // We just need to wait for shutdown signal
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    
+    // Cleanup
+    mainloop.borrow_mut().lock();
+    stream.borrow_mut().disconnect().ok();
+    context.borrow_mut().disconnect();
+    mainloop.borrow_mut().unlock();
+    mainloop.borrow_mut().stop();
+    
+    Ok(())
+}
+
+================
+File: src/gemini_client.rs
+================
+//! Redesigned Gemini Live API client with proper WebSocket handling
+//!
+//! This module implements a WebSocket client for the Gemini Live API using
+//! a split sink/stream approach for concurrent reading and writing.
+
+use crate::gemini::{
+    ApiResponse, BidiGenerateContentSetup, ClientMessage, Content, GeminiClientConfig, GeminiError,
+    GenerationConfig, Part, RealtimeAudio, RealtimeInput, RealtimeVideo, Result, ServerMessage,
+    Transcript,
+};
+
+use base64::engine::general_purpose;
+use base64::Engine; // Add this trait to use encode/decode methods
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{debug, error, info};
+
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Type alias for the WebSocket split sink, wrapped in Arc<Mutex<>>
+type WsSink = Arc<
+    Mutex<
+        futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+    >,
+>;
+
+/// Type alias for the WebSocket split stream
+type WsStream = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
+/// Connection state of the Gemini client
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionState {
+    Disconnected,
+    Connected,
+    SetupComplete,
+}
+
+/// Redesigned Gemini Live API client with split WebSocket handling
+pub struct GeminiClient {
+    config: GeminiClientConfig,
+    state: ConnectionState,
+    session_token: Option<String>,
+
+    // Direct reference to the WebSocket write half for sending messages
+    ws_writer: Option<WsSink>,
+
+    // Channel for receiving messages from the WebSocket
+    response_rx: mpsc::Receiver<Result<ApiResponse>>,
+
+    // Task handles to keep background tasks alive
+    _rx_task: Option<JoinHandle<()>>,
+    _tx_task: Option<JoinHandle<()>>,
+}
+
+impl GeminiClient {
+    /// Create a new Gemini client with the given configuration.
+    pub fn new(config: GeminiClientConfig) -> Self {
+        // Create dummy channel until connect() is called
+        let (_, response_rx) = mpsc::channel(100);
+
+        Self {
+            config,
+            state: ConnectionState::Disconnected,
+            session_token: None,
+            ws_writer: None,
+            response_rx,
+            _rx_task: None,
+            _tx_task: None,
+        }
+    }
+
+    /// Create a new Gemini client from an API key and optional configuration.
+    pub fn from_api_key(api_key: &str, config: Option<GeminiClientConfig>) -> Self {
+        let mut config = config.unwrap_or_default();
+        config.url = format!(
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={}",
+            api_key
+        );
+        Self::new(config)
+    }
+
+    /// Get a receiver to subscribe to responses without holding the client mutex
+    pub fn subscribe(&mut self) -> mpsc::Receiver<Result<ApiResponse>> {
+        // Replace self.response_rx with a fresh dummy so we keep ownership
+        let (dummy_tx, new_rx) = mpsc::channel(1);
+        let old_rx = std::mem::replace(&mut self.response_rx, new_rx);
+        // We don't care about dummy_tx – it just satisfies the type system
+        let _ = dummy_tx;
+        old_rx
+    }
+
+    /// Connect to the Live API endpoint and set up the session.
+    pub async fn connect_and_setup(&mut self) -> Result<()> {
+        self.connect().await?;
+        self.setup().await
+    }
+
+    /// Connect to the Live API endpoint.
+    pub async fn connect(&mut self) -> Result<()> {
+        if self.state != ConnectionState::Disconnected {
+            return Ok(());
+        }
+
+        info!("Connecting to Gemini API at {}", self.config.url);
+
+        // Connect to the WebSocket
+        let (ws_stream, resp) = connect_async(&self.config.url)
+            .await
+            .map_err(GeminiError::WebSocket)?;
+
+        debug!("WebSocket connection response: {:?}", resp);
+
+        // Split the WebSocket into separate sink (write) and stream (read) halves
+        let (sink, stream) = ws_stream.split();
+
+        // Wrap the sink in Arc<Mutex<>> to safely share it
+        let sink_shared: WsSink = Arc::new(Mutex::new(sink));
+
+        // Store the sink for later use in send()
+        self.ws_writer = Some(sink_shared.clone());
+
+        // ------ Set up the inbound message channel ------
+        let (response_tx, new_response_rx) = mpsc::channel::<Result<ApiResponse>>(100);
+
+        // Spawn a task to handle inbound messages
+        let rx_task = tokio::spawn(async move {
+            info!("Inbound message task started");
+
+            // Process incoming messages from the WebSocket
+            let mut stream = stream;
+
+            while let Some(message_result) = stream.next().await {
+                match message_result {
+                    Ok(Message::Text(text)) => {
+                        crate::tdbg!("⬅ websocket message received");
+                        debug!("Received text message: {}", text);
+
+                        // Parse and handle the server message
+                        match serde_json::from_str::<ServerMessage>(&text) {
+                            Ok(server_message) => {
+                                // Handle the server message based on its type
+                                match server_message {
+                                    ServerMessage::SetupComplete { .. } => {
+                                        if let Err(_) =
+                                            response_tx.send(Ok(ApiResponse::SetupComplete)).await
+                                        {
+                                            error!("Failed to send SetupComplete response");
+                                            break;
+                                        }
+                                    }
+                                    ServerMessage::ServerContent { server_content } => {
+                                        // Process model content, transcriptions, etc.
+                                        if let Err(_) =
+                                            handle_server_content(server_content, &response_tx)
+                                                .await
+                                        {
+                                            error!("Failed to handle server content");
+                                            break;
+                                        }
+                                    }
+                                    ServerMessage::ToolCall { tool_call } => {
+                                        if let Err(_) = response_tx
+                                            .send(Ok(ApiResponse::ToolCall(tool_call)))
+                                            .await
+                                        {
+                                            error!("Failed to send ToolCall response");
+                                            break;
+                                        }
+                                    }
+                                    ServerMessage::ToolCallCancellation {
+                                        tool_call_cancellation,
+                                    } => {
+                                        let id = tool_call_cancellation["id"]
+                                            .as_str()
+                                            .unwrap_or("unknown")
+                                            .to_string();
+
+                                        if let Err(_) = response_tx
+                                            .send(Ok(ApiResponse::ToolCallCancellation(id)))
+                                            .await
+                                        {
+                                            error!("Failed to send ToolCallCancellation response");
+                                            break;
+                                        }
+                                    }
+                                    ServerMessage::GoAway { .. } => {
+                                        if let Err(_) =
+                                            response_tx.send(Ok(ApiResponse::GoAway)).await
+                                        {
+                                            error!("Failed to send GoAway response");
+                                            break;
+                                        }
+                                    }
+                                    ServerMessage::SessionResumptionUpdate {
+                                        session_resumption_update,
+                                    } => {
+                                        let handle = session_resumption_update["newHandle"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+
+                                        if let Err(_) = response_tx
+                                            .send(Ok(ApiResponse::SessionResumptionUpdate(handle)))
+                                            .await
+                                        {
+                                            error!(
+                                                "Failed to send SessionResumptionUpdate response"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                                crate::tdbg!("✅ websocket message processed");
+                            }
+                            Err(e) => {
+                                error!("Failed to parse server message: {:?}", e);
+                                error!("Raw message: {}", text);
+
+                                if let Err(_) =
+                                    response_tx.send(Err(GeminiError::Serialization(e))).await
+                                {
+                                    error!("Failed to send parsing error");
+                                    break;
+                                }
+                                crate::tdbg!("✅ websocket message processing failed");
+                            }
+                        }
+                    }
+                    Ok(Message::Binary(bytes)) => {
+                        crate::tdbg!("⬅ websocket binary message received");
+                        // Try to decode binary message as UTF-8 to see error content
+                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                            debug!("Received binary message (decoded): {}", text);
+
+                            // Try to parse it as a ServerMessage - binary messages can be valid responses
+                            match serde_json::from_str::<ServerMessage>(&text) {
+                                Ok(server_message) => {
+                                    // Handle the server message based on its type
+                                    match server_message {
+                                        ServerMessage::SetupComplete { .. } => {
+                                            if let Err(_) = response_tx
+                                                .send(Ok(ApiResponse::SetupComplete))
+                                                .await
+                                            {
+                                                error!("Failed to send SetupComplete response");
+                                                break;
+                                            }
+                                        }
+                                        ServerMessage::ServerContent { server_content } => {
+                                            if let Err(_) =
+                                                handle_server_content(server_content, &response_tx)
+                                                    .await
+                                            {
+                                                error!("Failed to handle server content");
+                                                break;
+                                            }
+                                        }
+                                        ServerMessage::ToolCall { tool_call } => {
+                                            if let Err(_) = response_tx
+                                                .send(Ok(ApiResponse::ToolCall(tool_call)))
+                                                .await
+                                            {
+                                                error!("Failed to send ToolCall response");
+                                                break;
+                                            }
+                                        }
+                                        ServerMessage::ToolCallCancellation {
+                                            tool_call_cancellation,
+                                        } => {
+                                            let id = tool_call_cancellation["id"]
+                                                .as_str()
+                                                .unwrap_or("unknown")
+                                                .to_string();
+
+                                            if let Err(_) = response_tx
+                                                .send(Ok(ApiResponse::ToolCallCancellation(id)))
+                                                .await
+                                            {
+                                                error!(
+                                                    "Failed to send ToolCallCancellation response"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                        ServerMessage::GoAway { .. } => {
+                                            if let Err(_) =
+                                                response_tx.send(Ok(ApiResponse::GoAway)).await
+                                            {
+                                                error!("Failed to send GoAway response");
+                                                break;
+                                            }
+                                        }
+                                        ServerMessage::SessionResumptionUpdate {
+                                            session_resumption_update,
+                                        } => {
+                                            let handle = session_resumption_update["newHandle"]
+                                                .as_str()
+                                                .unwrap_or("")
+                                                .to_string();
+
+                                            if let Err(_) = response_tx
+                                                .send(Ok(ApiResponse::SessionResumptionUpdate(
+                                                    handle,
+                                                )))
+                                                .await
+                                            {
+                                                error!("Failed to send SessionResumptionUpdate response");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    crate::tdbg!("✅ websocket binary message processed");
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to parse binary message as server message: {:?}",
+                                        e
+                                    );
+                                    error!("Raw message: {}", text);
+                                    crate::tdbg!("✅ websocket binary message processing failed");
+                                }
+                            }
+                        } else {
+                            debug!("Received binary message ({} bytes)", bytes.len());
+                            crate::tdbg!("✅ websocket binary message skipped (not text)");
+                        }
+                    }
+                    Ok(Message::Close(frame)) => {
+                        if let Some(close_frame) = &frame {
+                            error!(
+                                "WebSocket closed with code {:?} and reason: {}",
+                                close_frame.code, close_frame.reason
+                            );
+
+                            // Log detailed analysis for common close reasons
+                            if close_frame.reason.contains("Invalid") {
+                                error!("CRITICAL: Server rejected a request with INVALID_ARGUMENT, check for:");
+                                error!(
+                                    "1. Mixing audio data with activity flags in the same frame"
+                                );
+                                error!("2. Using 'activityControl' instead of newer 'automaticActivityDetection'");
+                                error!("3. Sending activity signals in automatic detection mode");
+                            } else if close_frame.reason.contains("Explicit activity control") {
+                                error!(
+                                    "CRITICAL: Server rejected explicit activity control markers!"
+                                );
+                                error!(
+                                    "Make sure automaticActivityDetection.disabled is set to true"
+                                );
+                            }
+                        } else {
+                            info!("WebSocket closed without details");
+                        }
+
+                        // Notify that the connection is closed (for error handling)
+                        if let Err(_) = response_tx.send(Err(GeminiError::ConnectionClosed)).await {
+                            error!("Failed to send connection closed notification");
+                        }
+
+                        // Send a special ApiResponse message to tell main client to clean up writer
+                        // This is processed in next_response() and stream_responses() to clear state
+                        if let Err(_) = response_tx.send(Ok(ApiResponse::ConnectionClosed)).await {
+                            error!("Failed to send connection closed notification for cleanup");
+                        }
+
+                        break;
+                    }
+                    Ok(_) => {
+                        // Ignore other message types (ping/pong)
+                    }
+                    Err(e) => {
+                        error!("WebSocket error: {:?}", e);
+
+                        if let Err(_) = response_tx.send(Err(GeminiError::WebSocket(e))).await {
+                            error!("Failed to send WebSocket error");
+                        }
+
+                        break;
+                    }
+                }
+            }
+
+            info!("Inbound message task terminated");
+        });
+
+        // Store the response channel and task handles in the client
+        self.response_rx = new_response_rx;
+        self._rx_task = Some(rx_task);
+
+        // Update the client state
+        self.state = ConnectionState::Connected;
+        info!("Connected to Gemini API");
+
+        Ok(())
+    }
+
+    /// Initialize a session by sending the setup message.
+    pub async fn setup(&mut self) -> Result<()> {
+        if self.state == ConnectionState::Disconnected {
+            error!("Cannot setup session: Connection is closed");
+            return Err(GeminiError::ConnectionClosed);
+        }
+
+        if self.state == ConnectionState::SetupComplete {
+            info!("Session already set up");
+            return Ok(());
+        }
+
+        info!("Setting up Gemini session");
+
+        // Create the setup message
+        let mut setup = BidiGenerateContentSetup {
+            model: self.config.model.clone(),
+            // Convert the system instruction to the proper Content format if provided
+            system_instruction: self.config.system_instruction.as_ref().map(|instruction| {
+                Content {
+                    role: Some("SYSTEM".to_string()),
+                    parts: vec![Part {
+                        text: Some(instruction.clone()),
+                    }],
+                }
+            }),
+            ..Default::default()
+        };
+
+        // Set up generation config
+        let mut generation_config = GenerationConfig {
+            response_modalities: vec![self.config.response_modality.as_str().to_string()],
+            temperature: self.config.temperature,
+            ..Default::default()
+        };
+
+        // Add media resolution if specified
+        if let Some(resolution) = self.config.media_resolution {
+            generation_config.media_resolution = Some(resolution.as_str().to_string());
+        }
+
+        setup.generation_config = Some(generation_config);
+
+        // Create realtime_input_config with correct fields for the Live API
+        let mut realtime_config = if let Some(token) = &self.session_token {
+            serde_json::json!({
+                "sessionResumptionConfig": {
+                    "handle": token
+                }
+            })
+        } else {
+            serde_json::json!({})
+        };
+
+        // Configure for client-side VAD (since we're using Whisper-based segmentation)
+        let config_map = realtime_config.as_object_mut().unwrap();
+
+        // Disable automatic activity detection since we're doing client-side VAD
+        config_map.insert(
+            "automaticActivityDetection".to_string(),
+            serde_json::json!({
+                "disabled": true
+            }),
+        );
+
+        // Set activity handling for responsive interruptions
+        config_map.insert(
+            "activityHandling".to_string(),
+            serde_json::json!("START_OF_ACTIVITY_INTERRUPTS"),
+        );
+
+        // Set turnCoverage to include all input (not just within activity markers)
+        config_map.insert(
+            "turnCoverage".to_string(),
+            serde_json::json!("TURN_INCLUDES_ONLY_ACTIVITY"),
+        );
+
+        setup.realtime_input_config = Some(realtime_config);
+
+        info!("Sending setup message with model: {}", setup.model);
+
+        // Send the setup message directly using our send method
+        let msg = ClientMessage::Setup { setup };
+        if let Err(e) = self.send(&msg).await {
+            error!("Failed to send setup message: {:?}", e);
+            return Err(e);
+        }
+
+        info!("Setup message sent, waiting for acknowledgment");
+
+        // Wait for setup complete response with a timeout
+        let setup_completed =
+            tokio::time::timeout(Duration::from_secs(10), self.wait_for_setup_complete())
+                .await
+                .map_err(|_| {
+                    error!("Timeout waiting for setup complete message");
+                    GeminiError::Timeout
+                })??;
+
+        if setup_completed {
+            self.state = ConnectionState::SetupComplete;
+            info!("Gemini session setup complete");
+            Ok(())
+        } else {
+            error!("Failed to complete Gemini session setup");
+            Err(GeminiError::SetupNotComplete)
+        }
+    }
+
+    /// Wait for the setup complete message.
+    async fn wait_for_setup_complete(&mut self) -> Result<bool> {
+        let mut attempts = 0;
+        while attempts < 10 {
+            match self.response_rx.recv().await {
+                Some(Ok(ApiResponse::SetupComplete)) => {
+                    return Ok(true);
+                }
+                Some(Ok(_)) => {
+                    // Ignore other messages
+                    attempts += 1;
+                    continue;
+                }
+                Some(Err(e)) => {
+                    // Propagate any errors
+                    return Err(e);
+                }
+                None => {
+                    // Channel closed
+                    return Err(GeminiError::ChannelClosed);
+                }
+            }
+        }
+        Ok(false) // Timed out without seeing SetupComplete
+    }
+
+    /// Send a client message to the server using the WebSocket writer.
+    pub async fn send(&mut self, msg: &ClientMessage) -> Result<()> {
+        // Check if connection is already closed or writer is cleared
+        if self.state == ConnectionState::Disconnected || self.ws_writer.is_none() {
+            error!("Cannot send message: Connection is closed");
+            return Err(GeminiError::ConnectionClosed);
+        }
+
+        // Format the JSON based on message type
+        let json = match msg {
+            ClientMessage::Setup { setup } => {
+                // Format the JSON manually to avoid nesting issues
+                let setup_json =
+                    serde_json::to_string(setup).map_err(GeminiError::Serialization)?;
+                // Remove outer braces and wrap in setup: {...}
+                let inner = &setup_json[1..setup_json.len() - 1];
+                format!("{{\"setup\":{{{}}}}}", inner)
+            }
+            ClientMessage::ClientContent { client_content } => {
+                format!(
+                    "{{\"clientContent\":{}}}",
+                    serde_json::to_string(client_content).map_err(GeminiError::Serialization)?
+                )
+            }
+            ClientMessage::RealtimeInput { realtime_input } => {
+                format!(
+                    "{{\"realtimeInput\":{}}}",
+                    serde_json::to_string(realtime_input).map_err(GeminiError::Serialization)?
+                )
+            }
+            ClientMessage::ToolResponse { tool_response } => {
+                format!(
+                    "{{\"toolResponse\":{}}}",
+                    serde_json::to_string(tool_response).map_err(GeminiError::Serialization)?
+                )
+            }
+        };
+
+        // Log message type without the full content to avoid spamming the console
+        match msg {
+            ClientMessage::Setup { .. } => info!("Sending setup message to Gemini API"),
+            ClientMessage::ClientContent { .. } => info!("Sending text content to Gemini API"),
+            ClientMessage::RealtimeInput { realtime_input } => {
+                if realtime_input.audio.is_some() {
+                    if realtime_input.audio_stream_end.unwrap_or(false) {
+                        info!("Sending end-of-audio signal to Gemini API");
+                    } else {
+                        debug!("Sending audio chunk to Gemini API");
+                    }
+                } else if realtime_input.video.is_some() {
+                    debug!("Sending video frame to Gemini API");
+                } else if realtime_input.text.is_some() {
+                    info!("Sending streaming text to Gemini API");
+                }
+            }
+            ClientMessage::ToolResponse { .. } => info!("Sending tool response to Gemini API"),
+        };
+
+        // Use the WebSocket writer directly to send the message
+        if let Some(writer) = &self.ws_writer {
+            let mut writer_guard = writer.lock().await;
+            match writer_guard.send(Message::Text(json.into())).await {
+                Ok(_) => {
+                    debug!("Message sent successfully");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to send message: {:?}", e);
+
+                    // If we get a SendAfterClosing error, update our state
+                    if e.to_string().contains("SendAfterClosing") {
+                        error!("WebSocket is closed - will not try to send more messages");
+                        self.state = ConnectionState::Disconnected;
+                        // We'll clear the writer after the lock is released
+                        drop(writer_guard);
+                        self.ws_writer = None; // Prevent future send attempts
+                        return Err(GeminiError::WebSocket(e));
+                    }
+
+                    Err(GeminiError::WebSocket(e))
+                }
+            }
+        } else {
+            error!("WebSocket writer not available (not connected)");
+            Err(GeminiError::ConnectionClosed)
+        }
+    }
+
+    /// Send an audio chunk to the server.
+    ///
+    /// * `audio_data` - Raw PCM audio bytes
+    /// * `activity_start` - Set to true to mark the beginning of speech (user started talking)
+    /// * `activity_end` - Set to true to mark the end of speech (user finished talking)
+    /// * `is_end` - Set to true to mark the end of the audio stream (used with auto VAD)
+    pub async fn send_audio(
+        &mut self,
+        audio_data: &[u8],
+        activity_start: bool,
+        activity_end: bool,
+        is_end: bool,
+    ) -> Result<()> {
+        // IMPORTANT: Use the improved send_audio_with_activity method that properly
+        // separates audio data and flags into different messages
+        self.send_audio_with_activity(audio_data, activity_start, activity_end, is_end)
+            .await
+    }
+
+    /// Send a video frame to the server.
+    pub async fn send_video(&mut self, frame_data: &[u8], mime_type: &str) -> Result<()> {
+        // Encode video data as base64
+        let data = general_purpose::STANDARD.encode(frame_data);
+
+        let realtime_input = RealtimeInput {
+            audio: None,
+            video: Some(RealtimeVideo {
+                data,
+                mime_type: mime_type.to_string(),
+            }),
+            text: None,
+            activity_start: None,
+            activity_end: None,
+            audio_stream_end: None,
+        };
+
+        let msg = ClientMessage::RealtimeInput { realtime_input };
+        self.send(&msg).await
+    }
+
+    /// Send a text message to the server.
+    pub async fn send_text(&mut self, text: &str) -> Result<()> {
+        let client_content = serde_json::json!({
+            "turns": [{
+                "role": "user",
+                "parts": [{
+                    "text": text
+                }]
+            }],
+            "turnComplete": true
+        });
+
+        let msg = ClientMessage::ClientContent { client_content };
+        self.send(&msg).await
+    }
+
+    /// Send streaming text to the server (e.g. for partial typing).
+    pub async fn send_streaming_text(&mut self, text: &str) -> Result<()> {
+        let realtime_input = RealtimeInput {
+            audio: None,
+            video: None,
+            text: Some(text.to_string()),
+            activity_start: None,
+            activity_end: None,
+            audio_stream_end: None,
+        };
+
+        let msg = ClientMessage::RealtimeInput { realtime_input };
+        self.send(&msg).await
+    }
+
+    /// Receive the next response from the server.
+    pub async fn next_response(&mut self) -> Option<Result<ApiResponse>> {
+        let response = self.response_rx.recv().await;
+
+        // Check if this is the special ConnectionClosed message that requires client-side cleanup
+        if let Some(Ok(ApiResponse::ConnectionClosed)) = &response {
+            info!("Received ConnectionClosed message, clearing WebSocket writer");
+            // Clear the writer to prevent further send attempts
+            self.ws_writer = None;
+            self.state = ConnectionState::Disconnected;
+        }
+
+        response
+    }
+
+    /// Simplified helper for sending audio with clean parameter names
+    ///
+    /// When using with client-side VAD (automaticActivityDetection.disabled = true):
+    /// - Set activity_start=true to mark the beginning of a user turn
+    /// - Send multiple audio chunks with activity_start/end=false
+    /// - Set activity_end=true to mark the end of a user turn
+    /// - Set audio_stream_end=true when finished with entire session
+    ///
+    /// CRITICAL: Never mix audio data with activity flags in the same frame
+    /// The API treats all fields in RealtimeInput as a "oneof" union
+    pub async fn send_audio_with_activity(
+        &mut self,
+        audio_data: &[u8],
+        activity_start: bool,
+        activity_end: bool,
+        audio_stream_end: bool,
+    ) -> Result<()> {
+        // Log what we're doing to help with debugging
+        if cfg!(debug_assertions) {
+            debug!(
+                "send_audio_with_activity: data_len={}, start={}, end={}, stream_end={}",
+                audio_data.len(),
+                activity_start,
+                activity_end,
+                audio_stream_end
+            );
+        }
+
+        // Send activity_start flag in its own frame if requested
+        if activity_start {
+            let flag_only = RealtimeInput {
+                audio: None,
+                video: None,
+                text: None,
+                activity_start: Some(serde_json::json!({})),
+                activity_end: None,
+                audio_stream_end: None,
+            };
+            let msg = ClientMessage::RealtimeInput {
+                realtime_input: flag_only,
+            };
+            self.send(&msg).await?;
+        }
+
+        // If we have audio data, send it in its own clean frame (NO FLAGS)
+        if !audio_data.is_empty() {
+            // Send audio data only (no flags) in a clean frame
+            let data = general_purpose::STANDARD.encode(audio_data);
+            let audio_only = RealtimeInput {
+                audio: Some(RealtimeAudio {
+                    data,
+                    mime_type: "audio/pcm;rate=16000".to_string(),
+                }),
+                video: None,
+                text: None,
+                activity_start: None,   // IMPORTANT: No flags with audio data
+                activity_end: None,     // IMPORTANT: No flags with audio data
+                audio_stream_end: None, // IMPORTANT: No flags with audio data
+            };
+
+            let msg = ClientMessage::RealtimeInput {
+                realtime_input: audio_only,
+            };
+            self.send(&msg).await?;
+        }
+
+        // Send activity_end or audio_stream_end flags in their own frame if requested
+        if activity_end || audio_stream_end {
+            let flag_only = RealtimeInput {
+                audio: None,
+                video: None,
+                text: None,
+                activity_start: None,
+                activity_end: if activity_end {
+                    Some(serde_json::json!({}))
+                } else {
+                    None
+                },
+                audio_stream_end: if audio_stream_end { Some(true) } else { None },
+            };
+            let msg = ClientMessage::RealtimeInput {
+                realtime_input: flag_only,
+            };
+            self.send(&msg).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Stream responses until a condition is met.
+    pub async fn stream_responses<F>(&mut self, mut callback: F) -> Result<()>
+    where
+        F: FnMut(&ApiResponse) -> bool,
+    {
+        while let Some(response) = self.response_rx.recv().await {
+            match &response {
+                Ok(ApiResponse::ConnectionClosed) => {
+                    info!("Received ConnectionClosed message in stream, clearing WebSocket writer");
+                    // Clear the writer to prevent further send attempts
+                    self.ws_writer = None;
+                    self.state = ConnectionState::Disconnected;
+
+                    // Call the callback with this special message
+                    let should_stop = callback(&ApiResponse::ConnectionClosed);
+                    if should_stop {
+                        break;
+                    }
+                }
+                Ok(resp) => {
+                    let should_stop = callback(resp);
+                    if should_stop {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    return Err(e.clone()); // Now this is safe with our manual Clone implementation
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Store a session resumption token for later reconnection.
+    pub fn set_session_token(&mut self, token: String) {
+        self.session_token = Some(token);
+    }
+
+    /// Get the current connection state.
+    pub fn state(&self) -> &'static str {
+        match self.state {
+            ConnectionState::Disconnected => "Disconnected",
+            ConnectionState::Connected => "Connected",
+            ConnectionState::SetupComplete => "SetupComplete",
+        }
+    }
+}
+
+/// Process server content messages which can contain different types of data.
+async fn handle_server_content(
+    content: serde_json::Value,
+    response_tx: &mpsc::Sender<Result<ApiResponse>>,
+) -> Result<()> {
+    // Check for input transcription (from audio we sent)
+    if let Some(input_transcription) = content.get("inputTranscription") {
+        // Safely extract text, providing a default if missing
+        let text = match input_transcription.get("text").and_then(|t| t.as_str()) {
+            Some(t) => t.to_string(),
+            None => {
+                tracing::warn!(
+                    "Received input transcription without text field: {:?}",
+                    input_transcription
+                );
+                String::new() // Empty string as fallback
+            }
+        };
+
+        // Safely extract isFinal flag
+        let is_final = input_transcription
+            .get("isFinal")
+            .and_then(|f| f.as_bool())
+            .unwrap_or(false);
+
+        // Only send if we have actual text content
+        if !text.is_empty() {
+            response_tx
+                .send(Ok(ApiResponse::InputTranscription(Transcript {
+                    text,
+                    is_final,
+                })))
+                .await
+                .map_err(|_| {
+                    tracing::error!("Failed to send input transcription via channel");
+                    GeminiError::ChannelClosed
+                })?;
+        }
+    }
+
+    // Check for output transcription (text of model's speech)
+    if let Some(output_transcription) = content.get("outputTranscription") {
+        // Safely extract text, providing a default if missing
+        let text = match output_transcription.get("text").and_then(|t| t.as_str()) {
+            Some(t) => t.to_string(),
+            None => {
+                tracing::warn!(
+                    "Received output transcription without text field: {:?}",
+                    output_transcription
+                );
+                String::new() // Empty string as fallback
+            }
+        };
+
+        // Safely extract isFinal flag
+        let is_final = output_transcription
+            .get("isFinal")
+            .and_then(|f| f.as_bool())
+            .unwrap_or(false);
+
+        // Only send if we have actual text content
+        if !text.is_empty() {
+            response_tx
+                .send(Ok(ApiResponse::OutputTranscription(Transcript {
+                    text,
+                    is_final,
+                })))
+                .await
+                .map_err(|_| {
+                    tracing::error!("Failed to send output transcription via channel");
+                    GeminiError::ChannelClosed
+                })?;
+        }
+    }
+
+    // Check for generationComplete flag
+    if let Some(generation_complete) = content.get("generationComplete").and_then(|g| g.as_bool()) {
+        if generation_complete {
+            tracing::info!("Generation complete received from Gemini");
+            response_tx
+                .send(Ok(ApiResponse::GenerationComplete))
+                .await
+                .map_err(|_| {
+                    tracing::error!("Failed to send GenerationComplete via channel");
+                    GeminiError::ChannelClosed
+                })?;
+        }
+    }
+
+    // Check for model turn (the actual response)
+    if let Some(model_turn) = content.get("modelTurn") {
+        // Get parts array, log warning if missing
+        let parts = match model_turn.get("parts").and_then(|p| p.as_array()) {
+            Some(parts) => parts,
+            None => {
+                tracing::warn!("Received model turn without parts array: {:?}", model_turn);
+                return Ok(()); // Skip processing if no parts
+            }
+        };
+
+        // Safely extract completion flag
+        let is_complete = content
+            .get("generationComplete")
+            .and_then(|g| g.as_bool())
+            .unwrap_or(false);
+
+        // Process each part in the response
+        for part in parts {
+            // Check for text response
+            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                if !text.is_empty() {
+                    response_tx
+                        .send(Ok(ApiResponse::TextResponse {
+                            text: text.to_string(),
+                            is_complete,
+                        }))
+                        .await
+                        .map_err(|_| {
+                            tracing::error!("Failed to send text response via channel");
+                            GeminiError::ChannelClosed
+                        })?;
+                }
+            }
+            // Check for audio response (inline data)
+            else if let Some(inline_data) = part.get("inlineData") {
+                // Try to extract and decode the base64 data
+                match inline_data.get("data").and_then(|d| d.as_str()) {
+                    Some(data_str) => {
+                        match general_purpose::STANDARD.decode(data_str) {
+                            Ok(data) => {
+                                // Only send if we have actual data
+                                if !data.is_empty() {
+                                    response_tx
+                                        .send(Ok(ApiResponse::AudioResponse { data, is_complete }))
+                                        .await
+                                        .map_err(|_| {
+                                            tracing::error!(
+                                                "Failed to send audio response via channel"
+                                            );
+                                            GeminiError::ChannelClosed
+                                        })?;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to decode base64 audio data: {:?}", e);
+                                // Continue processing other parts even if one fails
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            "Received inline data without data field: {:?}",
+                            inline_data
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+================
+File: src/main.rs
+================
+//! main.rs – entry point for RhoLive assistant
+//!
+//! Invariants
+//! ----------
+//! • AutomaticActivityDetection is DISABLED ⇒ we *must* emit activityStart /
+//!   activityEnd ourselves. audioStreamEnd is never sent.
+//! • Never mix blobs and markers in the same RealtimeInput message.
+//! • activityEnd **must** be the last message of a turn; no video frames after it.
+//!
+//! Turn life-cycle
+//! ---------------
+//!  audio  : ───────── start ……………… chunks ……………… end ───────┐
+//!  video  : ─ frame ─ frame ─ frame ────────────────╯        │ OR Video-Only Turn
+//!  markers: start───────────────┐  ┌──────────end             ├─ start ── end (video frames sent continuously)
+//!                               ▼  ▼                          │
+//!             [one Gemini server turn –⇢ generationComplete]──┘
+
+pub mod audio;
+pub mod audio_async;
+pub mod audio_seg;
+mod gemini;
+mod gemini_client;
+mod screen;
+pub mod ui;
+mod util;
+
+use audio_async::AsyncAudioCapturer;
+use audio_seg::{AudioSegmenter, SegConfig, SegmentedTurn, i16_slice_to_u8};
+use gemini::{GeminiClientConfig, MediaResolution, ResponseModality, ApiResponse};
+use gemini_client::GeminiClient;
+use screen::ScreenCapturer;
+use ui::{launch_ui, AudioSample, ConversationEntry};
+use std::{error::Error, sync::{Arc, atomic::{AtomicBool, Ordering, AtomicU32}}, time::{Duration, Instant}};
+use tokio::{
+    sync::{mpsc, Mutex},
+    time::sleep,
+};
+use tracing::{debug, error, info};
+
+// Configuration for video-only turns
+const VIDEO_TURN_CHECK_INTERVAL: Duration = Duration::from_secs(1); // How often to consider a video-only turn
+const MIN_NEW_FRAMES_FOR_VIDEO_TURN: u32 = 1; // Min new unique frames sent to Gemini to trigger video turn
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // ─────────────────── logging & panic backtrace ─────────────────────────
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
+    std::env::set_var("RUST_BACKTRACE", "full");
+
+    // ─────────────────── Gemini Live API connection ────────────────────────
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .expect("set GEMINI_API_KEY in the environment");
+    let mut gemini = GeminiClient::from_api_key(
+        &api_key,
+        Some(GeminiClientConfig {
+            model: "models/gemini-2.0-flash-live-001".into(),
+            response_modality: ResponseModality::Text,
+            system_instruction: Some(
+                "\
+you are a silent helper meant to assist the user in whatever task they choose. if you see a leetcode problem on the screen, solve it without waiting for them to say anything. if someone they are on call with asks you a question, answer it. you are effectively their second mind, they should not have to do any thinking, they should not have to ask you for anything. you are their brain, they should not have to think, respond to whatever is on screen or whatever someone says like the user would.
+
+when there is no change or nothing to work, do, or comment on, respond only with '<nothing>' (without quotes).
+                \
+                ".into(),
+            ),
+            media_resolution: Some(MediaResolution::Medium),
+            temperature: Some(0.7),
+            ..Default::default()
+        }),
+    );
+    gemini.connect_and_setup().await?;
+    let mut gem_rx = gemini.subscribe();          // for logging / UI
+    let gem = Arc::new(Mutex::new(gemini));      // shared writer guard
+
+    // Launch UI and get state handle
+    let ui_state = launch_ui();
+    
+    // Update connection status
+    {
+        let mut state = ui_state.lock().unwrap();
+        state.connected = true;
+        state.status_message = "Connected to Gemini Live API".to_string();
+    }
+    info!("✅ Connected to Gemini Live API");
+    info!("🎯 Model: gemini-2.0-flash-live-001");
+
+    // ─────────────────── audio capture & segmenter ─────────────────────────
+    let mut mic = AsyncAudioCapturer::new("rholive", None)?;
+    let device_name = mic.device_name();
+    info!("🎙️  mic: {}", device_name);
+    
+    // Update UI with audio device info
+    {
+        let mut state = ui_state.lock().unwrap();
+        state.audio_device = Some(device_name.to_string());
+        state.status_message = format!("Using microphone: {}", device_name);
+    }
+
+    let mut segmenter = AudioSegmenter::new(
+        SegConfig {
+            open_voiced_frames: 4,      // 80ms to open (responsive)
+            close_silence_ms: 600,      // 600ms silence to close (reasonable pauses)
+            max_turn_ms: 8000,          // 8 seconds max (good for demo)
+            min_clause_tokens: 10,       // 4 tokens for clause detection
+            asr_poll_ms: 400,           // Poll every 400ms
+            ring_capacity: 320_000,     // 20 seconds buffer
+            asr_pool_size: 2,           // 2 worker threads
+            asr_timeout_ms: 2000,       // 2 second timeout
+        },
+        Some(std::path::Path::new("./tiny.en-q8.gguf")),
+    )?;
+    
+    info!("📊 Audio segmentation configured:");
+    info!("   • Silence threshold: 600ms");
+    info!("   • Max turn length: 8s");
+    info!("   • ASR model: tiny.en-q8.gguf");
+    
+    // Update UI status
+    {
+        let mut state = ui_state.lock().unwrap();
+        state.status_message = "Audio segmentation configured".to_string();
+    }
+
+    // channel carrying complete turns
+    let (turn_tx, mut turn_rx) = mpsc::channel::<SegmentedTurn>(8);
+    
+    // channel for screen frames (continuous capture)
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(16);
+
+    // helper to send a single JPEG
+    async fn send_frame(gem: &Arc<Mutex<GeminiClient>>, jpeg: &[u8], mime: &str) {
+        let mut g = gem.lock().await;
+        if let Err(e) = g.send_video(jpeg, mime).await {
+            error!("send_video: {e:?}");
+        }
+    }
+    
+    // ─────────────────── continuous screen capture ─────────────────────────
+    tokio::spawn({
+        let frame_tx = frame_tx.clone();
+        let ui_state_clone = ui_state.clone();
+        async move {
+            let mut screen = match ScreenCapturer::new() {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to create screen capturer: {e}");
+                    return;
+                }
+            };
+            screen.set_capture_interval(Duration::from_millis(500)); // 2 FPS
+            info!("📸 Continuous screen capture started at 2 FPS");
+            
+            // Update UI status
+            if let Ok(mut state) = ui_state_clone.lock() {
+                state.status_message = "Screen capture active (2 FPS)".to_string();
+            }
+            
+            let mut last_hash = 0u64;
+            let mut frames_captured = 0u32;
+            let mut frames_skipped = 0u32;
+            
+            loop {
+                match screen.capture_frame() {
+                    Ok(mut frame) => {
+                        frames_captured += 1;
+                        let current_hash = frame.hash();
+                        
+                        // Skip duplicate frames
+                        if current_hash != last_hash {
+                            last_hash = current_hash;
+                            match frame.to_jpeg() {
+                                Ok(jpeg) => {
+                                    if frame_tx.send(jpeg.to_vec()).await.is_err() {
+                                        error!("Frame channel closed, stopping screen capture");
+                                        break;
+                                    }
+                                }
+                                Err(e) => error!("JPEG conversion failed: {e}"),
+                            }
+                        } else {
+                            frames_skipped += 1;
+                            if frames_skipped % 100 == 0 { // Log less frequently
+                                debug!("Skipped {} duplicate frames", frames_skipped);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if !err_str.contains("not reached") {
+                            debug!("screen capture error: {err_str}");
+                        }
+                    }
+                }
+                // Screen capturer's internal interval usually dictates capture rate.
+                // This sleep ensures the loop doesn't spin too fast if capture_frame is quick.
+                sleep(Duration::from_millis(100)).await;
+            }
+            
+            info!("Screen capture stopped. Captured: {}, Skipped: {}", frames_captured, frames_skipped);
+        }
+    });
+
+    // Shared state to track if Gemini is currently processing a turn
+    let is_gemini_processing = Arc::new(AtomicBool::new(false));
+
+    // ─────────────────── orchestrator: one task per turn (audio-initiated) ─────
+    tokio::spawn({
+        let gem = gem.clone();
+        let ui_state_clone = ui_state.clone();
+        let is_gemini_processing = is_gemini_processing.clone(); // Clone Arc for the task
+        async move {
+            while let Some(turn) = turn_rx.recv().await {
+                is_gemini_processing.store(true, Ordering::SeqCst); // Mark Gemini as busy
+
+                info!("📤 Sending AUDIO turn to Gemini: {} samples ({:.2}s)", 
+                      turn.audio.len(), 
+                      turn.audio.len() as f32 / 16000.0);
+                
+                // Update UI with transcript and add to conversation history
+                if let Some(text) = &turn.text {
+                    let mut state = ui_state_clone.lock().unwrap();
+                    state.current_transcript = text.clone();
+                    // Add user transcript to history
+                    state.conversation_history.push_back(ConversationEntry {
+                        role: "User".to_string(),
+                        text: text.clone(),
+                        timestamp: Instant::now(),
+                    });
+                    // Keep history size reasonable
+                    if state.conversation_history.len() > 50 {
+                        state.conversation_history.pop_front();
+                    }
+                }
+                
+                // 1️⃣ activityStart
+                {
+                    let mut g = gem.lock().await;
+                    g.send_audio_with_activity(&[], true, false, false).await.ok();
+                }
+
+                // 2️⃣ No need for per-turn frame pusher - we have continuous capture
+
+                // 3️⃣ stream audio blobs (≤ 256 kB each)
+                {
+                    let mut g = gem.lock().await;
+                    let pcm = i16_slice_to_u8(&turn.audio);
+                    for chunk in pcm.chunks(256_000) {
+                        g.send_audio_with_activity(chunk, false, false, false).await.ok();
+                    }
+                }
+
+                // 4️⃣ activityEnd – last realtimeInput of the turn
+                {
+                    let mut g = gem.lock().await;
+                    g.send_audio_with_activity(&[], false, true, false).await.ok();
+                }
+                // is_gemini_processing will be set to false when GenerationComplete is received
+            }
+        }
+    });
+
+    info!("🚀 RhoLive is ready! Start speaking or let it watch your screen...");
+    
+    {
+        let mut state = ui_state.lock().unwrap();
+        state.status_message = "Ready! Start speaking or let it watch...".to_string();
+    }
+
+    let mut last_status_update_time = Instant::now();
+    let mut segments_processed = 0u32;
+    let mut last_frame_send_time = Instant::now(); // Renamed for clarity
+    let mut frames_sent_to_gemini = 0u32; // Renamed for clarity
+    let mut last_audio_level_update_time = Instant::now(); // Renamed
+
+    // State for video-only turns
+    let mut last_video_turn_check_time = Instant::now();
+    let mut frames_at_last_video_turn: u32 = 0;
+
+    // ─────────────────── main audio/UI loop ─────────────────────────────
+    loop {
+        tokio::select! {
+            // Handle Gemini responses
+            Some(msg) = gem_rx.recv() => {
+                match msg {
+                    Ok(resp) => match resp {
+                        ApiResponse::TextResponse { text, is_complete } => {
+                            // Update UI with Gemini response
+                            let mut state = ui_state.lock().unwrap();
+                            
+                            debug!("TextResponse: is_complete={}, text_len={}, text_preview={}", 
+                                   is_complete, text.len(), 
+                                   text.chars().take(50).collect::<String>());
+                            
+                            if is_complete {
+                                // Final response - use accumulated text if available
+                                let final_response = if state.current_ai_response.is_empty() {
+                                    // No accumulated text, use the final chunk
+                                    text.clone()
+                                } else {
+                                    // We have accumulated text, use it (it should already include this final chunk)
+                                    // But append the final text just in case
+                                    if !text.is_empty() && !state.current_ai_response.ends_with(&text) {
+                                        state.current_ai_response.push_str(&text);
+                                    }
+                                    state.current_ai_response.clone()
+                                };
+                                
+                                // Add complete response to history (ignore <nothing> responses)
+                                if !final_response.is_empty() && final_response != "<nothing>" {
+                                    state.conversation_history.push_back(ConversationEntry {
+                                        role: "Gemini".to_string(),
+                                        text: final_response.clone(),
+                                        timestamp: Instant::now(),
+                                    });
+                                    // Keep history size reasonable
+                                    if state.conversation_history.len() > 50 {
+                                        state.conversation_history.pop_front();
+                                    }
+                                    info!("🤖 Gemini complete: {}", final_response);
+                                }
+                                
+                                // Clear current response and transcript
+                                state.current_ai_response.clear();
+                                state.current_transcript.clear(); // Clear user transcript too
+                                state.typewriter_position = 0;
+                                state.typewriter_last_update = Instant::now();
+                                is_gemini_processing.store(false, Ordering::SeqCst); // Gemini is done
+                            } else {
+                                // Streaming response - simply append the new text chunk
+                                // Ignore <nothing> responses
+                                if text != "<nothing>" {
+                                    // If this is the first chunk, reset typewriter position
+                                    if state.current_ai_response.is_empty() {
+                                        state.typewriter_position = 0;
+                                        state.typewriter_last_update = Instant::now();
+                                        state.last_activity = Instant::now();
+                                    }
+                                    state.current_ai_response.push_str(&text);
+                                    debug!("🤖 Gemini streaming: {} new chars (total: {} chars)", 
+                                           text.len(), 
+                                           state.current_ai_response.len());
+                                }
+                            }
+                        }
+                        ApiResponse::GenerationComplete => {
+                            debug!("Generation complete");
+                            // Ensure processing flag is cleared if no text response indicated completion
+                            if is_gemini_processing.load(Ordering::SeqCst) {
+                                let mut state = ui_state.lock().unwrap();
+                                if !state.current_ai_response.is_empty() && state.current_ai_response != "<nothing>" {
+                                    let response_text = state.current_ai_response.clone();
+                                    state.conversation_history.push_back(ConversationEntry {
+                                        role: "Gemini".to_string(),
+                                        text: response_text.clone(),
+                                        timestamp: Instant::now(),
+                                    });
+                                    if state.conversation_history.len() > 50 { state.conversation_history.pop_front(); }
+                                    info!("🤖 Gemini complete (from GenComplete): {}", response_text);
+                                }
+                                state.current_ai_response.clear();
+                                state.current_transcript.clear();
+                                state.typewriter_position = 0;
+                                state.typewriter_last_update = Instant::now();
+                            }
+                            is_gemini_processing.store(false, Ordering::SeqCst); // Gemini is done
+                        }
+                        other => debug!("Gemini: {other:?}"),
+                    },
+                    Err(e) => {
+                        error!("Gemini error: {e:?}");
+                        is_gemini_processing.store(false, Ordering::SeqCst); // Error, so not processing
+                    },
+                }
+            }
+            
+            // Handle audio chunks
+            Some(chunk) = mic.read_chunk() => {
+                if last_audio_level_update_time.elapsed() >= Duration::from_millis(20) {
+                    let level = calculate_audio_level(&chunk);
+                    let mut state = ui_state.lock().unwrap();
+                    state.audio_samples.push_back(AudioSample {
+                        level,
+                        timestamp: Instant::now(),
+                    });
+                    // Keep only last 200 samples (4 seconds at 50Hz)
+                    if state.audio_samples.len() > 200 {
+                        state.audio_samples.pop_front();
+                    }
+                    state.is_speaking = level > 0.01;
+                    last_audio_level_update_time = Instant::now();
+                }
+                
+                // Process the buffer through the segmenter
+                if let Some(turn) = segmenter.push_chunk(&chunk) {
+                    segments_processed += 1;
+                    info!("🎯 Detected speech segment #{}: {} samples ({:.2}s)", 
+                          segments_processed,
+                          turn.audio.len(), 
+                          turn.audio.len() as f32 / 16000.0);
+                    
+                    // Update UI
+                    {
+                        let mut state = ui_state.lock().unwrap();
+                        state.segments_processed = segments_processed;
+                        state.is_speaking = false; // Reset speaking indicator after segment detection
+                        if let Some(text) = &turn.text {
+                            state.current_transcript = text.clone();
+                            info!("   Early transcript: {}", text);
+                        }
+                        state.status_message = format!("Segment #{} detected ({:.1}s)", 
+                                                     segments_processed, 
+                                                     turn.audio.len() as f32 / 16000.0);
+                    }
+                    info!("   Reason: {:?}", turn.close_reason);
+                    
+                    if turn_tx.send(turn).await.is_err() {
+                        error!("Failed to send turn to orchestrator");
+                        break; // Critical error
+                    }
+                }
+            }
+            
+            // Handle screen frames - send them to Gemini
+            Some(jpeg) = frame_rx.recv() => {
+                if last_frame_send_time.elapsed() >= Duration::from_millis(500) { // Approx 2 FPS to Gemini
+                    info!("📸 Sending screenshot #{} to Gemini (size: {} bytes)", 
+                          frames_sent_to_gemini + 1, jpeg.len());
+                    
+                    send_frame(&gem, &jpeg, "image/jpeg").await;
+                    frames_sent_to_gemini += 1;
+                    last_frame_send_time = Instant::now();
+                    
+                    {
+                        let mut state = ui_state.lock().unwrap();
+                        state.frames_sent = frames_sent_to_gemini; // Update UI
+                    }
+                }
+            }
+            
+            // Periodic checks (status updates and video-only turns)
+            _ = sleep(Duration::from_millis(500)) => { // Check fairly often
+                // Video-only turn logic
+                if last_video_turn_check_time.elapsed() >= VIDEO_TURN_CHECK_INTERVAL {
+                    last_video_turn_check_time = Instant::now(); // Reset check timer
+
+                    if !is_gemini_processing.load(Ordering::SeqCst) { // Only if Gemini is idle
+                        let current_total_frames_sent = frames_sent_to_gemini; // From our counter
+                        let new_unique_frames_for_video_turn = current_total_frames_sent.saturating_sub(frames_at_last_video_turn);
+
+                        if new_unique_frames_for_video_turn >= MIN_NEW_FRAMES_FOR_VIDEO_TURN {
+                            info!("💡 Initiating VIDEO-ONLY turn ({} new unique frames).", new_unique_frames_for_video_turn);
+                            is_gemini_processing.store(true, Ordering::SeqCst); // Mark Gemini as busy
+
+                            { // Update UI
+                                let mut state = ui_state.lock().unwrap();
+                                state.status_message = "Analyzing screen content...".to_string();
+                                state.current_transcript.clear(); // No user audio for this turn
+                                state.conversation_history.push_back(ConversationEntry {
+                                    role: "System".to_string(),
+                                    text: "[Screen analysis initiated by system]".to_string(),
+                                    timestamp: Instant::now(),
+                                });
+                                if state.conversation_history.len() > 50 {
+                                    state.conversation_history.pop_front();
+                                }
+                            }
+
+                            // Send activityStart for video-only turn
+                            {
+                                let mut g = gem.lock().await;
+                                g.send_audio_with_activity(&[], true, false, false).await.ok();
+                            }
+                            // Video frames are sent by their own task. Gemini will use the most recent ones.
+                            // Send activityEnd for video-only turn
+                            {
+                                let mut g = gem.lock().await;
+                                g.send_audio_with_activity(&[], false, true, false).await.ok();
+                            }
+                            frames_at_last_video_turn = current_total_frames_sent;
+                            // is_gemini_processing will be set to false when GenerationComplete is received
+                        }
+                    }
+                }
+
+                // Status update logic (runs less frequently than the 500ms sleep, due to its own timer)
+                if last_status_update_time.elapsed() >= Duration::from_secs(5) {
+                    if !is_gemini_processing.load(Ordering::SeqCst) { // Only update to "Listening" if idle
+                        let mut state = ui_state.lock().unwrap();
+                        state.status_message = "Listening...".to_string();
+                    }
+                    debug!("Status: segments_processed={}, frames_sent_to_gemini={}", segments_processed, frames_sent_to_gemini);
+                    last_status_update_time = Instant::now();
+                }
+            }
+            
+            else => {
+                // All channels closed or other select! termination
+                info!("Main loop select! terminated. Exiting.");
+                break;
+            }
+        }
+    }
+    
+    info!("RhoLive assistant shutting down.");
+    Ok(())
+}
+
+/// Calculate RMS audio level from PCM samples
+fn calculate_audio_level(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    
+    let sum_squares: f64 = samples.iter()
+        .map(|&s| (s as f64).powi(2))
+        .sum();
+    
+    let rms = (sum_squares / samples.len() as f64).sqrt();
+    // Normalize to 0.0-1.0 range (i16 max is 32767)
+    (rms / 32767.0) as f32
+}
+
+================
+File: src/screen.rs
+================
+use std::collections::hash_map::DefaultHasher;
+use std::error::Error;
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::sync::mpsc::Receiver;
+use std::time::Duration;
+use tracing::{debug, info, warn};
+use xcap::{Frame, Monitor, VideoRecorder};
+
+/// Screen capture error that is Send + Sync
+#[derive(Debug)]
+pub enum ScreenError {
+    XcapError(String),
+    NoMonitors,
+    FrameConversionError(String),
+    Other(String),
+}
+
+impl fmt::Display for ScreenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScreenError::XcapError(e) => write!(f, "Xcap error: {}", e),
+            ScreenError::NoMonitors => write!(f, "No monitors found"),
+            ScreenError::FrameConversionError(e) => write!(f, "Frame conversion error: {}", e),
+            ScreenError::Other(e) => write!(f, "Screen capture error: {}", e),
+        }
+    }
+}
+
+impl Error for ScreenError {}
+
+// Make it Send + Sync
+unsafe impl Send for ScreenError {}
+unsafe impl Sync for ScreenError {}
+
+/// Represents a captured screen frame with conversion options.
+#[derive(Debug)]
+pub struct CapturedFrame {
+    /// The raw frame data from XCap
+    pub frame: Frame,
+    /// The JPEG encoded data, lazily computed
+    jpeg_data: Option<Vec<u8>>,
+}
+
+impl CapturedFrame {
+    /// Create a new CapturedFrame from an XCap Frame
+    pub fn new(frame: Frame) -> Self {
+        Self {
+            frame,
+            jpeg_data: None,
+        }
+    }
+
+    /// Convert the frame to JPEG format for sending to the Gemini API
+    pub fn to_jpeg(&mut self) -> Result<&[u8], ScreenError> {
+        if self.jpeg_data.is_none() {
+            // Convert the raw RGBA buffer to JPEG
+            let width = self.frame.width;
+            let height = self.frame.height;
+
+            // Create an RgbaImage from the raw data
+            let rgba_image = image::RgbaImage::from_raw(width, height, self.frame.raw.clone())
+                .ok_or_else(|| ScreenError::FrameConversionError("Failed to create image from raw data".to_string()))?;
+
+            // First convert RGBA to RGB by dropping the alpha channel
+            let rgb_image = image::DynamicImage::ImageRgba8(rgba_image).into_rgb8();
+
+            // Encode as JPEG with reasonable quality
+            let mut jpeg_buffer = Vec::new();
+            let mut encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buffer, 75);
+            encoder.encode(&rgb_image, width, height, image::ExtendedColorType::Rgb8)
+                .map_err(|e| ScreenError::FrameConversionError(e.to_string()))?;
+
+            self.jpeg_data = Some(jpeg_buffer);
+        }
+
+        Ok(self.jpeg_data.as_ref().unwrap())
+    }
+
+    /// Returns the MIME type for the encoded image format
+    pub fn mime_type(&self) -> &'static str {
+        "image/jpeg"
+    }
+
+    /// Get the width of the frame
+    pub fn width(&self) -> u32 {
+        self.frame.width
+    }
+
+    /// Get the height of the frame
+    pub fn height(&self) -> u32 {
+        self.frame.height
+    }
+    
+    /// Calculate a hash of the frame for duplicate detection
+    pub fn hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut hasher = DefaultHasher::new();
+        
+        // Hash a subset of pixels for efficiency
+        let step = (self.frame.raw.len() / 1000).max(1);
+        for i in (0..self.frame.raw.len()).step_by(step) {
+            self.frame.raw[i].hash(&mut hasher);
+        }
+        
+        // Include dimensions in hash
+        self.frame.width.hash(&mut hasher);
+        self.frame.height.hash(&mut hasher);
+        
+        hasher.finish()
+    }
+}
+
+/// Captures frames from the primary monitor using the `xcap` crate.
+pub struct ScreenCapturer {
+    video_recorder: VideoRecorder,
+    frame_rx: Receiver<Frame>,
+    capture_interval: Duration,
+    last_capture: std::time::Instant,
+    monitor_info: MonitorInfo,
+    // Frame deduplication tracking
+    last_frame_hash: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MonitorInfo {
+    name: String,
+    width: u32,
+    height: u32,
+    is_primary: bool,
+}
+
+impl ScreenCapturer {
+    /// Create a new screen capturer for the primary monitor with default options.
+    pub fn new() -> Result<Self, ScreenError> {
+        Self::with_options(Duration::from_millis(500))
+    }
+
+    /// Create a new screen capturer for the primary monitor with specified capture interval.
+    pub fn with_options(capture_interval: Duration) -> Result<Self, ScreenError> {
+        // Get all monitors and use the first one
+        let monitors = Monitor::all()
+            .map_err(|e| ScreenError::XcapError(e.to_string()))?;
+        if monitors.is_empty() {
+            return Err(ScreenError::NoMonitors);
+        }
+
+        // Find primary monitor if available
+        let monitor = monitors
+            .iter()
+            .find(|m| m.is_primary().unwrap_or(false))
+            .unwrap_or(&monitors[0])
+            .clone();
+
+        // Store monitor information
+        let monitor_info = MonitorInfo {
+            name: monitor.name().unwrap_or_else(|_| "Unknown".to_string()),
+            width: monitor.width().unwrap_or(0),
+            height: monitor.height().unwrap_or(0),
+            is_primary: monitor.is_primary().unwrap_or(false),
+        };
+
+        info!(
+            "Using monitor: {} ({}x{}, primary: {})",
+            monitor_info.name, monitor_info.width, monitor_info.height, monitor_info.is_primary
+        );
+
+        let (video_recorder, frame_rx) = monitor.video_recorder()
+            .map_err(|e| ScreenError::XcapError(e.to_string()))?;
+        video_recorder.start()
+            .map_err(|e| ScreenError::XcapError(e.to_string()))?;
+
+        Ok(Self {
+            video_recorder,
+            frame_rx,
+            capture_interval,
+            last_capture: std::time::Instant::now(),
+            monitor_info,
+            last_frame_hash: None,
+        })
+    }
+
+    /// Calculate a hash for a frame to use for deduplication
+    fn calculate_frame_hash(frame: &Frame) -> u64 {
+        let mut hasher = DefaultHasher::new();
+
+        // Create a smaller sampling of the frame for faster hashing
+        // Sample every 20th pixel to get a representative hash
+        if !frame.raw.is_empty() {
+            let stride = 20 * 4; // Every 20th RGBA pixel
+            for i in (0..frame.raw.len()).step_by(stride) {
+                if i < frame.raw.len() {
+                    frame.raw[i].hash(&mut hasher);
+                }
+            }
+        }
+
+        // Also hash the dimensions
+        frame.width.hash(&mut hasher);
+        frame.height.hash(&mut hasher);
+
+        hasher.finish()
+    }
+
+    /// Capture a single frame of the screen.
+    /// This method respects the configured capture interval.
+    pub fn capture_frame(&mut self) -> Result<CapturedFrame, ScreenError> {
+        let now = std::time::Instant::now();
+
+        // Check if we need to throttle frame captures
+        if now.duration_since(self.last_capture) < self.capture_interval {
+            debug!("Capture interval not reached, throttling capture");
+            return Err(ScreenError::Other("Capture interval not reached".to_string()));
+        }
+
+        // Try to receive a frame with timeout
+        match self.frame_rx.recv_timeout(Duration::from_millis(800)) {
+            // Increased timeout
+            Ok(frame) => {
+                debug!("Captured frame: {}x{}", frame.width, frame.height);
+
+                // Calculate hash for deduplication
+                let frame_hash = Self::calculate_frame_hash(&frame);
+
+                // Check if it's a duplicate
+                if let Some(last_hash) = self.last_frame_hash {
+                    if frame_hash == last_hash {
+                        warn!("Duplicate frame detected, skipping");
+                        return Err(ScreenError::Other("Duplicate frame".to_string()));
+                    }
+                }
+
+                // Update state
+                self.last_capture = now;
+                self.last_frame_hash = Some(frame_hash);
+
+                Ok(CapturedFrame::new(frame))
+            }
+            Err(e) => {
+                // Log the error but don't propagate timeout errors as they're expected
+                if let std::sync::mpsc::RecvTimeoutError::Timeout = e {
+                    debug!("Timed out waiting for screen frame, this is normal");
+                    Err(ScreenError::Other("Frame capture timeout".to_string()))
+                } else {
+                    tracing::error!("Error receiving frame from xcap: {:?}", e);
+                    Err(ScreenError::Other(format!("Receive error: {:?}", e)))
+                }
+            }
+        }
+    }
+
+    /// Force a frame capture regardless of interval
+    pub fn force_capture_frame(&mut self) -> Result<CapturedFrame, ScreenError> {
+        // Reset the last capture time
+        self.last_capture =
+            std::time::Instant::now() - self.capture_interval - Duration::from_millis(1);
+
+        // For forced captures, we'll still capture even if it's a duplicate
+        match self.frame_rx.recv_timeout(Duration::from_millis(800)) {
+            Ok(frame) => {
+                debug!("Forced capture of frame: {}x{}", frame.width, frame.height);
+
+                // Calculate hash for future comparison
+                let frame_hash = Self::calculate_frame_hash(&frame);
+                self.last_frame_hash = Some(frame_hash);
+
+                // Update state
+                self.last_capture = std::time::Instant::now();
+
+                Ok(CapturedFrame::new(frame))
+            }
+            Err(e) => {
+                // Log the error but don't propagate timeout errors as they're expected
+                if let std::sync::mpsc::RecvTimeoutError::Timeout = e {
+                    debug!("Timed out waiting for forced screen frame");
+                    Err(ScreenError::Other("Frame capture timeout".to_string()))
+                } else {
+                    tracing::error!("Error receiving forced frame from xcap: {:?}", e);
+                    Err(ScreenError::Other(format!("Receive error: {:?}", e)))
+                }
+            }
+        }
+    }
+
+    /// Configure the capture interval (minimum time between frames)
+    pub fn set_capture_interval(&mut self, interval: Duration) {
+        self.capture_interval = interval;
+    }
+
+    /// Get information about the monitor being captured
+    pub fn monitor_info(&self) -> &MonitorInfo {
+        &self.monitor_info
+    }
+}
+
+================
+File: GEMINI_LIVE_API.md
+================
+Live API
+
+Preview: The Live API is in preview.
+The Live API enables low-latency bidirectional voice and video interactions with Gemini, letting you talk to Gemini live while also streaming video input or sharing your screen. Using the Live API, you can provide end users with the experience of natural, human-like voice conversations.
+
+You can try the Live API in Google AI Studio. To use the Live API in Google AI Studio, select Stream.
+
+How the Live API works
+Streaming
+The Live API uses a streaming model over a WebSocket connection. When you interact with the API, a persistent connection is created. Your input (audio, video, or text) is streamed continuously to the model, and the model's response (text or audio) is streamed back in real-time over the same connection.
+
+This bidirectional streaming ensures low latency and supports features such as voice activity detection, tool usage, and speech generation.
+
+Live API Overview
+
+For more information about the underlying WebSockets API, see the WebSockets API reference.
+
+Warning: It is unsafe to insert your API key into client-side JavaScript or TypeScript code. Use server-side deployments for accessing the Live API in production.
+Output generation
+The Live API processes multimodal input (text, audio, video) to generate text or audio in real-time. It comes with a built-in mechanism to generate audio and depending on the model version you use, it uses one of the two audio generation methods:
+
+Half cascade: The model receives native audio input and uses a specialized model cascade of distinct models to process the input and to generate audio output.
+Native: Gemini 2.5 introduces native audio generation, which directly generates audio output, providing a more natural sounding audio, more expressive voices, more awareness of additional context, e.g., tone, and more proactive responses.
+Building with Live API
+Before you begin building with the Live API, choose the audio generation approach that best fits your needs.
+
+Establishing a connection
+The following example shows how to create a connection with an API key:
+
+Python
+JavaScript
+
+import asyncio
+from google import genai
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+
+model = "gemini-2.0-flash-live-001"
+config = {"response_modalities": ["TEXT"]}
+
+async def main():
+async with client.aio.live.connect(model=model, config=config) as session:
+print("Session started")
+
+if __name__ == "__main__":
+asyncio.run(main())
+Note: You can only set one modality in the response_modalities field. This means that you can configure the model to respond with either text or audio, but not both in the same session.
+Sending and receiving text
+Here's how you can send and receive text:
+
+Python
+JavaScript
+
+import asyncio
+from google import genai
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+model = "gemini-2.0-flash-live-001"
+
+config = {"response_modalities": ["TEXT"]}
+
+async def main():
+async with client.aio.live.connect(model=model, config=config) as session:
+message = "Hello, how are you?"
+await session.send_client_content(
+turns={"role": "user", "parts": [{"text": message}]}, turn_complete=True
+)
+
+        async for response in session.receive():
+            if response.text is not None:
+                print(response.text, end="")
+
+if __name__ == "__main__":
+asyncio.run(main())
+Sending and receiving audio
+You can send audio by converting it to 16-bit PCM, 16kHz, mono format. This example reads a WAV file and sends it in the correct format:
+
+Python
+JavaScript
+
+# Test file: https://storage.googleapis.com/generativeai-downloads/data/16000.wav
+# Install helpers for converting files: pip install librosa soundfile
+import asyncio
+import io
+from pathlib import Path
+from google import genai
+from google.genai import types
+import soundfile as sf
+import librosa
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+model = "gemini-2.0-flash-live-001"
+
+config = {"response_modalities": ["TEXT"]}
+
+async def main():
+async with client.aio.live.connect(model=model, config=config) as session:
+
+        buffer = io.BytesIO()
+        y, sr = librosa.load("sample.wav", sr=16000)
+        sf.write(buffer, y, sr, format='RAW', subtype='PCM_16')
+        buffer.seek(0)
+        audio_bytes = buffer.read()
+
+        # If already in correct format, you can use this:
+        # audio_bytes = Path("sample.pcm").read_bytes()
+
+        await session.send_realtime_input(
+            audio=types.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")
+        )
+
+        async for response in session.receive():
+            if response.text is not None:
+                print(response.text)
+
+if __name__ == "__main__":
+asyncio.run(main())
+You can receive audio by setting AUDIO as response modality. This example saves the received data as WAV file:
+
+Python
+JavaScript
+
+import asyncio
+import wave
+from google import genai
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+model = "gemini-2.0-flash-live-001"
+
+config = {"response_modalities": ["AUDIO"]}
+
+async def main():
+async with client.aio.live.connect(model=model, config=config) as session:
+wf = wave.open("audio.wav", "wb")
+wf.setnchannels(1)
+wf.setsampwidth(2)
+wf.setframerate(24000)
+
+        message = "Hello how are you?"
+        await session.send_client_content(
+            turns={"role": "user", "parts": [{"text": message}]}, turn_complete=True
+        )
+
+        async for response in session.receive():
+            if response.data is not None:
+                wf.writeframes(response.data)
+
+            # Un-comment this code to print audio data info
+            # if response.server_content.model_turn is not None:
+            #      print(response.server_content.model_turn.parts[0].inline_data.mime_type)
+
+        wf.close()
+
+if __name__ == "__main__":
+asyncio.run(main())
+Audio formats
+Audio data in the Live API is always raw, little-endian, 16-bit PCM. Audio output always uses a sample rate of 24kHz. Input audio is natively 16kHz, but the Live API will resample if needed so any sample rate can be sent. To convey the sample rate of input audio, set the MIME type of each audio-containing Blob to a value like audio/pcm;rate=16000.
+
+Receiving audio transcriptions
+You can enable transcription of the model's audio output by sending output_audio_transcription in the setup config. The transcription language is inferred from the model's response.
+
+
+import asyncio
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+model = "gemini-2.0-flash-live-001"
+
+config = {"response_modalities": ["AUDIO"],
+"output_audio_transcription": {}
+}
+
+async def main():
+async with client.aio.live.connect(model=model, config=config) as session:
+message = "Hello? Gemini are you there?"
+
+        await session.send_client_content(
+            turns={"role": "user", "parts": [{"text": message}]}, turn_complete=True
+        )
+
+        async for response in session.receive():
+            if response.server_content.model_turn:
+                print("Model turn:", response.server_content.model_turn)
+            if response.server_content.output_transcription:
+                print("Transcript:", response.server_content.output_transcription.text)
+
+
+if __name__ == "__main__":
+asyncio.run(main())
+You can enable transcription of the audio input by sending input_audio_transcription in setup config.
+
+
+import asyncio
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+model = "gemini-2.0-flash-live-001"
+
+config = {"response_modalities": ["TEXT"],
+"realtime_input_config": {
+"automatic_activity_detection": {"disabled": True},
+"activity_handling": "NO_INTERRUPTION",
+},
+"input_audio_transcription": {},
+}
+
+async def main():
+async with client.aio.live.connect(model=model, config=config) as session:
+audio_data = Path("sample.pcm").read_bytes()
+
+        await session.send_realtime_input(activity_start=types.ActivityStart())
+        await session.send_realtime_input(
+            audio=types.Blob(data=audio_data, mime_type='audio/pcm;rate=16000')
+        )
+        await session.send_realtime_input(activity_end=types.ActivityEnd())
+
+        async for msg in session.receive():
+            if msg.server_content.input_transcription:
+                print('Transcript:', msg.server_content.input_transcription.text)
+
+if __name__ == "__main__":
+asyncio.run(main())
+Streaming audio and video
+To see an example of how to use the Live API in a streaming audio and video format, run the "Live API - Get Started" file in the cookbooks repository:
+
+View on GitHub
+
+System instructions
+System instructions let you steer the behavior of a model based on your specific needs and use cases. System instructions can be set in the setup configuration and will remain in effect for the entire session.
+
+
+from google.genai import types
+
+config = {
+"system_instruction": types.Content(
+parts=[
+types.Part(
+text="You are a helpful assistant and answer in a friendly tone."
+)
+]
+),
+"response_modalities": ["TEXT"],
+}
+Incremental content updates
+Use incremental updates to send text input, establish session context, or restore session context. For short contexts you can send turn-by-turn interactions to represent the exact sequence of events:
+
+Python
+JSON
+
+turns = [
+{"role": "user", "parts": [{"text": "What is the capital of France?"}]},
+{"role": "model", "parts": [{"text": "Paris"}]},
+]
+
+await session.send_client_content(turns=turns, turn_complete=False)
+
+turns = [{"role": "user", "parts": [{"text": "What is the capital of Germany?"}]}]
+
+await session.send_client_content(turns=turns, turn_complete=True)
+For longer contexts it's recommended to provide a single message summary to free up the context window for subsequent interactions.
+
+Changing voice and language
+The Live API supports the following voices: Puck, Charon, Kore, Fenrir, Aoede, Leda, Orus, and Zephyr.
+
+To specify a voice, set the voice name within the speechConfig object as part of the session configuration:
+
+Python
+JSON
+
+from google.genai import types
+
+config = types.LiveConnectConfig(
+response_modalities=["AUDIO"],
+speech_config=types.SpeechConfig(
+voice_config=types.VoiceConfig(
+prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
+)
+)
+)
+Note: If you're using the generateContent API, the set of available voices is slightly different. See the audio generation guide for generateContent audio generation voices.
+The Live API supports multiple languages.
+
+To change the language, set the language code within the speechConfig object as part of the session configuration:
+
+
+from google.genai import types
+
+config = types.LiveConnectConfig(
+response_modalities=["AUDIO"],
+speech_config=types.SpeechConfig(
+language_code="de-DE",
+)
+)
+Note: Native audio output models automatically choose the appropriate language and don't support explicitly setting the language code.
+Native audio output
+Through the Live API, you can also access models that allow for native audio output in addition to native audio input. This allows for higher quality audio outputs with better pacing, voice naturalness, verbosity, and mood.
+
+Native audio output is supported by the following native audio models:
+
+gemini-2.5-flash-preview-native-audio-dialog
+gemini-2.5-flash-exp-native-audio-thinking-dialog
+Note: Native audio models currently have limited tool use support. See Overview of supported tools for details.
+How to use native audio output
+To use native audio output, configure one of the native audio models and set response_modalities to AUDIO.
+
+See Sending and receiving audio for a full example.
+
+Python
+JavaScript
+
+model = "gemini-2.5-flash-preview-native-audio-dialog"
+config = types.LiveConnectConfig(response_modalities=["AUDIO"])
+
+async with client.aio.live.connect(model=model, config=config) as session:
+# Send audio input and receive audio
+Affective dialog
+This feature lets Gemini adapt its response style to the input expression and tone.
+
+To use affective dialog, set the api version to v1alpha and set enable_affective_dialog to truein the setup message:
+
+Python
+JavaScript
+
+client = genai.Client(api_key="GOOGLE_API_KEY", http_options={"api_version": "v1alpha"})
+
+config = types.LiveConnectConfig(
+response_modalities=["AUDIO"],
+enable_affective_dialog=True
+)
+Note that affective dialog is currently only supported by the native audio output models.
+
+Proactive audio
+When this feature is enabled, Gemini can proactively decide not to respond if the content is not relevant.
+
+To use it, set the api version to v1alpha and configure the proactivity field in the setup message and set proactive_audio to true:
+
+Python
+JavaScript
+
+client = genai.Client(api_key="GOOGLE_API_KEY", http_options={"api_version": "v1alpha"})
+
+config = types.LiveConnectConfig(
+response_modalities=["AUDIO"],
+proactivity={'proactive_audio': True}
+)
+Note that proactive audio is currently only supported by the native audio output models.
+
+Native audio output with thinking
+Native audio output supports thinking capabilities, available via a separate model gemini-2.5-flash-exp-native-audio-thinking-dialog.
+
+See Sending and receiving audio for a full example.
+
+Python
+JavaScript
+
+model = "gemini-2.5-flash-exp-native-audio-thinking-dialog"
+config = types.LiveConnectConfig(response_modalities=["AUDIO"])
+
+async with client.aio.live.connect(model=model, config=config) as session:
+# Send audio input and receive audio
+Tool use with Live API
+You can define tools such as Function calling, Code execution, and Google Search with the Live API.
+
+To see examples of all tools in the Live API, run the "Live API Tools" cookbook:
+
+View on GitHub
+
+Overview of supported tools
+Here's a brief overview of the available tools for each model:
+
+Tool	Cascaded models
+gemini-2.0-flash-live-001	gemini-2.5-flash-preview-native-audio-dialog	gemini-2.5-flash-exp-native-audio-thinking-dialog
+Search	Yes	Yes	Yes
+Function calling	Yes	Yes	No
+Code execution	Yes	No	No
+Url context	Yes	No	No
+Function calling
+You can define function declarations as part of the session configuration. See the Function calling tutorial to learn more.
+
+After receiving tool calls, the client should respond with a list of FunctionResponse objects using the session.send_tool_response method.
+
+Note: Unlike the generateContent API, the Live API doesn't support automatic tool response handling. You must handle tool responses manually in your client code.
+
+import asyncio
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+model = "gemini-2.0-flash-live-001"
+
+# Simple function definitions
+turn_on_the_lights = {"name": "turn_on_the_lights"}
+turn_off_the_lights = {"name": "turn_off_the_lights"}
+
+tools = [{"function_declarations": [turn_on_the_lights, turn_off_the_lights]}]
+config = {"response_modalities": ["TEXT"], "tools": tools}
+
+async def main():
+async with client.aio.live.connect(model=model, config=config) as session:
+prompt = "Turn on the lights please"
+await session.send_client_content(turns={"parts": [{"text": prompt}]})
+
+        async for chunk in session.receive():
+            if chunk.server_content:
+                if chunk.text is not None:
+                    print(chunk.text)
+            elif chunk.tool_call:
+                function_responses = []
+                for fc in tool_call.function_calls:
+                    function_response = types.FunctionResponse(
+                        id=fc.id,
+                        name=fc.name,
+                        response={ "result": "ok" } # simple, hard-coded function response
+                    )
+                    function_responses.append(function_response)
+
+                await session.send_tool_response(function_responses=function_responses)
+
+
+if __name__ == "__main__":
+asyncio.run(main())
+From a single prompt, the model can generate multiple function calls and the code necessary to chain their outputs. This code executes in a sandbox environment, generating subsequent BidiGenerateContentToolCall messages.
+
+Asynchronous function calling
+By default, the execution pauses until the results of each function call are available, which ensures sequential processing. It means you won't be able to continue interacting with the model while the functions are being run.
+
+If you don't want to block the conversation, you can tell the model to run the functions asynchronously.
+
+To do so, you first need to add a behavior to the function definitions:
+
+
+# Non-blocking function definitions
+turn_on_the_lights = {"name": "turn_on_the_lights", "behavior": "NON_BLOCKING"} # turn_on_the_lights will run asynchronously
+turn_off_the_lights = {"name": "turn_off_the_lights"} # turn_off_the_lights will still pause all interactions with the model
+NON-BLOCKING will ensure the function will run asynchronously while you can continue interacting with the model.
+
+Then you need to tell the model how to behave when it receives the FunctionResponse using the scheduling parameter. It can either:
+
+Interrupt what it's doing and tell you about the response it got right away (scheduling="INTERRUPT"),
+Wait until it's finished with what it's currently doing (scheduling="WHEN_IDLE"),
+Or do nothing and use that knowledge later on in the discussion (scheduling="SILENT")
+
+# Non-blocking function definitions
+function_response = types.FunctionResponse(
+id=fc.id,
+name=fc.name,
+response={
+"result": "ok",
+"scheduling": "INTERRUPT" # Can also be WHEN_IDLE or SILENT
+}
+)
+Code execution
+You can define code execution as part of the session configuration. See the Code execution tutorial to learn more.
+
+
+import asyncio
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+model = "gemini-2.0-flash-live-001"
+
+tools = [{'code_execution': {}}]
+config = {"response_modalities": ["TEXT"], "tools": tools}
+
+async def main():
+async with client.aio.live.connect(model=model, config=config) as session:
+prompt = "Compute the largest prime palindrome under 100000."
+await session.send_client_content(turns={"parts": [{"text": prompt}]})
+
+        async for chunk in session.receive():
+            if chunk.server_content:
+                if chunk.text is not None:
+                    print(chunk.text)
+            
+                model_turn = chunk.server_content.model_turn
+                if model_turn:
+                    for part in model_turn.parts:
+                      if part.executable_code is not None:
+                        print(part.executable_code.code)
+
+                      if part.code_execution_result is not None:
+                        print(part.code_execution_result.output)
+
+if __name__ == "__main__":
+asyncio.run(main())
+Grounding with Google Search
+You can enable Grounding with Google Search as part of the session configuration. See the Grounding tutorial to learn more.
+
+
+import asyncio
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+model = "gemini-2.0-flash-live-001"
+
+tools = [{'google_search': {}}]
+config = {"response_modalities": ["TEXT"], "tools": tools}
+
+async def main():
+async with client.aio.live.connect(model=model, config=config) as session:
+prompt = "When did the last Brazil vs. Argentina soccer match happen?"
+await session.send_client_content(turns={"parts": [{"text": prompt}]})
+
+        async for chunk in session.receive():
+            if chunk.server_content:
+                if chunk.text is not None:
+                    print(chunk.text)
+
+                # The model might generate and execute Python code to use Search
+                model_turn = chunk.server_content.model_turn
+                if model_turn:
+                    for part in model_turn.parts:
+                      if part.executable_code is not None:
+                        print(part.executable_code.code)
+
+                      if part.code_execution_result is not None:
+                        print(part.code_execution_result.output)
+
+if __name__ == "__main__":
+asyncio.run(main())
+Combining multiple tools
+You can combine multiple tools within the Live API:
+
+
+prompt = """
+Hey, I need you to do three things for me.
+
+1. Compute the largest prime palindrome under 100000.
+2. Then use Google Search to look up information about the largest earthquake in California the week of Dec 5 2024?
+3. Turn on the lights
+
+Thanks!
+"""
+
+tools = [
+{"google_search": {}},
+{"code_execution": {}},
+{"function_declarations": [turn_on_the_lights, turn_off_the_lights]},
+]
+
+config = {"response_modalities": ["TEXT"], "tools": tools}
+Handling interruptions
+Users can interrupt the model's output at any time. When Voice activity detection (VAD) detects an interruption, the ongoing generation is canceled and discarded. Only the information already sent to the client is retained in the session history. The server then sends a BidiGenerateContentServerContent message to report the interruption.
+
+In addition, the Gemini server discards any pending function calls and sends a BidiGenerateContentServerContent message with the IDs of the canceled calls.
+
+
+async for response in session.receive():
+if response.server_content.interrupted is True:
+# The generation was interrupted
+Voice activity detection (VAD)
+You can configure or disable voice activity detection (VAD).
+
+Using automatic VAD
+By default, the model automatically performs VAD on a continuous audio input stream. VAD can be configured with the realtimeInputConfig.automaticActivityDetection field of the setup configuration.
+
+When the audio stream is paused for more than a second (for example, because the user switched off the microphone), an audioStreamEnd event should be sent to flush any cached audio. The client can resume sending audio data at any time.
+
+
+# example audio file to try:
+# URL = "https://storage.googleapis.com/generativeai-downloads/data/hello_are_you_there.pcm"
+# !wget -q $URL -O sample.pcm
+import asyncio
+from pathlib import Path
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+model = "gemini-2.0-flash-live-001"
+
+config = {"response_modalities": ["TEXT"]}
+
+async def main():
+async with client.aio.live.connect(model=model, config=config) as session:
+audio_bytes = Path("sample.pcm").read_bytes()
+
+        await session.send_realtime_input(
+            audio=types.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")
+        )
+
+        # if stream gets paused, send:
+        # await session.send_realtime_input(audio_stream_end=True)
+
+        async for response in session.receive():
+            if response.text is not None:
+                print(response.text)
+
+if __name__ == "__main__":
+asyncio.run(main())
+With send_realtime_input, the API will respond to audio automatically based on VAD. While send_client_content adds messages to the model context in order, send_realtime_input is optimized for responsiveness at the expense of deterministic ordering.
+
+Configuring automatic VAD
+For more control over the VAD activity, you can configure the following parameters. See API reference for more info.
+
+
+from google.genai import types
+
+config = {
+"response_modalities": ["TEXT"],
+"realtime_input_config": {
+"automatic_activity_detection": {
+"disabled": False, # default
+"start_of_speech_sensitivity": types.StartSensitivity.START_SENSITIVITY_LOW,
+"end_of_speech_sensitivity": types.EndSensitivity.END_SENSITIVITY_LOW,
+"prefix_padding_ms": 20,
+"silence_duration_ms": 100,
+}
+}
+}
+Disabling automatic VAD
+Alternatively, the automatic VAD can be disabled by setting realtimeInputConfig.automaticActivityDetection.disabled to true in the setup message. In this configuration the client is responsible for detecting user speech and sending activityStart and activityEnd messages at the appropriate times. An audioStreamEnd isn't sent in this configuration. Instead, any interruption of the stream is marked by an activityEnd message.
+
+
+config = {
+"response_modalities": ["TEXT"],
+"realtime_input_config": {"automatic_activity_detection": {"disabled": True}},
+}
+
+async with client.aio.live.connect(model=model, config=config) as session:
+# ...
+await session.send_realtime_input(activity_start=types.ActivityStart())
+await session.send_realtime_input(
+audio=types.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")
+)
+await session.send_realtime_input(activity_end=types.ActivityEnd())
+# ...
+Token count
+You can find the total number of consumed tokens in the usageMetadata field of the returned server message.
+
+
+async for message in session.receive():
+# The server will periodically send messages that include UsageMetadata.
+if message.usage_metadata:
+usage = message.usage_metadata
+print(
+f"Used {usage.total_token_count} tokens in total. Response token breakdown:"
+)
+for detail in usage.response_tokens_details:
+match detail:
+case types.ModalityTokenCount(modality=modality, token_count=count):
+print(f"{modality}: {count}")
+Extending the session duration
+The maximum session duration can be extended to unlimited with two mechanisms:
+
+Context window compression
+Session resumption
+Furthermore, you'll receive a GoAway message before the session ends, allowing you to take further actions.
+
+Context window compression
+To enable longer sessions, and avoid abrupt connection termination, you can enable context window compression by setting the contextWindowCompression field as part of the session configuration.
+
+In the ContextWindowCompressionConfig, you can configure a sliding-window mechanism and the number of tokens that triggers compression.
+
+
+from google.genai import types
+
+config = types.LiveConnectConfig(
+response_modalities=["AUDIO"],
+context_window_compression=(
+# Configures compression with default parameters.
+types.ContextWindowCompressionConfig(
+sliding_window=types.SlidingWindow(),
+)
+),
+)
+Session resumption
+To prevent session termination when the server periodically resets the WebSocket connection, configure the sessionResumption field within the setup configuration.
+
+Passing this configuration causes the server to send SessionResumptionUpdate messages, which can be used to resume the session by passing the last resumption token as the SessionResumptionConfig.handle of the subsequent connection.
+
+
+import asyncio
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="GEMINI_API_KEY")
+model = "gemini-2.0-flash-live-001"
+
+async def main():
+print(f"Connecting to the service with handle {previous_session_handle}...")
+async with client.aio.live.connect(
+model=model,
+config=types.LiveConnectConfig(
+response_modalities=["AUDIO"],
+session_resumption=types.SessionResumptionConfig(
+# The handle of the session to resume is passed here,
+# or else None to start a new session.
+handle=previous_session_handle
+),
+),
+) as session:
+while True:
+await session.send_client_content(
+turns=types.Content(
+role="user", parts=[types.Part(text="Hello world!")]
+)
+)
+async for message in session.receive():
+# Periodically, the server will send update messages that may
+# contain a handle for the current state of the session.
+if message.session_resumption_update:
+update = message.session_resumption_update
+if update.resumable and update.new_handle:
+# The handle should be retained and linked to the session.
+return update.new_handle
+
+                # For the purposes of this example, placeholder input is continually fed
+                # to the model. In non-sample code, the model inputs would come from
+                # the user.
+                if message.server_content and message.server_content.turn_complete:
+                    break
+
+if __name__ == "__main__":
+asyncio.run(main())
+Receiving a message before the session disconnects
+The server sends a GoAway message that signals that the current connection will soon be terminated. This message includes the timeLeft, indicating the remaining time and lets you take further action before the connection will be terminated as ABORTED.
+
+
+async for response in session.receive():
+if response.go_away is not None:
+# The connection will soon be terminated
+print(response.go_away.time_left)
+Receiving a message when the generation is complete
+The server sends a generationComplete message that signals that the model finished generating the response.
+
+
+async for response in session.receive():
+if response.server_content.generation_complete is True:
+# The generation is complete
+Media resolution
+You can specify the media resolution for the input media by setting the mediaResolution field as part of the session configuration:
+
+
+from google.genai import types
+
+config = types.LiveConnectConfig(
+response_modalities=["AUDIO"],
+media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+)
+Limitations
+Consider the following limitations of the Live API when you plan your project.
+
+Response modalities
+You can only set one response modality (TEXT or AUDIO) per session in the session configuration. Setting both results in a config error message. This means that you can configure the model to respond with either text or audio, but not both in the same session.
+
+Client authentication
+The Live API only provides server to server authentication and isn't recommended for direct client use. Client input should be routed through an intermediate application server for secure authentication with the Live API.
+
+Session duration
+Session duration can be extended to unlimited by enabling session compression. Without compression, audio-only sessions are limited to 15 minutes, and audio plus video sessions are limited to 2 minutes. Exceeding these limits without compression will terminate the connection.
+
+Additionally, you can configure session resumption to allow the client to resume a session that was terminated.
+
+Context window
+A session has a context window limit of:
+
+128k tokens for native audio output models
+32k tokens for other Live API models
+
+Live API - WebSockets API reference
+Preview: The Live API is in preview.
+The Live API is a stateful API that uses WebSockets. In this section, you'll find additional details regarding the WebSockets API.
+
+Sessions
+A WebSocket connection establishes a session between the client and the Gemini server. After a client initiates a new connection the session can exchange messages with the server to:
+
+Send text, audio, or video to the Gemini server.
+Receive audio, text, or function call requests from the Gemini server.
+WebSocket connection
+To start a session, connect to this websocket endpoint:
+
+
+wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent
+Note: The URL is for version v1beta.
+Session configuration
+The initial message after connection sets the session configuration, which includes the model, generation parameters, system instructions, and tools.
+
+You can change the configuration parameters except the model during the session.
+
+See the following example configuration. Note that the name casing in SDKs may vary. You can look up the Python SDK configuration options here.
+
+
+{
+"model": string,
+"generationConfig": {
+"candidateCount": integer,
+"maxOutputTokens": integer,
+"temperature": number,
+"topP": number,
+"topK": integer,
+"presencePenalty": number,
+"frequencyPenalty": number,
+"responseModalities": [string],
+"speechConfig": object,
+"mediaResolution": object
+},
+"systemInstruction": string,
+"tools": [object]
+}
+For more information on the API field, see generationConfig.
+
+Send messages
+To exchange messages over the WebSocket connection, the client must send a JSON object over an open WebSocket connection. The JSON object must have exactly one of the fields from the following object set:
+
+
+{
+"setup": BidiGenerateContentSetup,
+"clientContent": BidiGenerateContentClientContent,
+"realtimeInput": BidiGenerateContentRealtimeInput,
+"toolResponse": BidiGenerateContentToolResponse
+}
+Supported client messages
+See the supported client messages in the following table:
+
+Message	Description
+BidiGenerateContentSetup	Session configuration to be sent in the first message
+BidiGenerateContentClientContent	Incremental content update of the current conversation delivered from the client
+BidiGenerateContentRealtimeInput	Real time audio, video, or text input
+BidiGenerateContentToolResponse	Response to a ToolCallMessage received from the server
+Receive messages
+To receive messages from Gemini, listen for the WebSocket 'message' event, and then parse the result according to the definition of the supported server messages.
+
+See the following:
+
+
+async with client.aio.live.connect(model='...', config=config) as session:
+await session.send(input='Hello world!', end_of_turn=True)
+async for message in session.receive():
+print(message)
+Server messages may have a usageMetadata field but will otherwise include exactly one of the other fields from the BidiGenerateContentServerMessage message. (The messageType union is not expressed in JSON so the field will appear at the top-level of the message.)
+
+Messages and events
+ActivityEnd
+This type has no fields.
+
+Marks the end of user activity.
+
+ActivityHandling
+The different ways of handling user activity.
+
+Enums
+ACTIVITY_HANDLING_UNSPECIFIED	If unspecified, the default behavior is START_OF_ACTIVITY_INTERRUPTS.
+START_OF_ACTIVITY_INTERRUPTS	If true, start of activity will interrupt the model's response (also called "barge in"). The model's current response will be cut-off in the moment of the interruption. This is the default behavior.
+NO_INTERRUPTION	The model's response will not be interrupted.
+ActivityStart
+This type has no fields.
+
+Marks the start of user activity.
+
+AudioTranscriptionConfig
+This type has no fields.
+
+The audio transcription configuration.
+
+AutomaticActivityDetection
+Configures automatic detection of activity.
+
+Fields
+disabled
+bool
+
+Optional. If enabled (the default), detected voice and text input count as activity. If disabled, the client must send activity signals.
+
+startOfSpeechSensitivity
+StartSensitivity
+
+Optional. Determines how likely speech is to be detected.
+
+prefixPaddingMs
+int32
+
+Optional. The required duration of detected speech before start-of-speech is committed. The lower this value, the more sensitive the start-of-speech detection is and shorter speech can be recognized. However, this also increases the probability of false positives.
+
+endOfSpeechSensitivity
+EndSensitivity
+
+Optional. Determines how likely detected speech is ended.
+
+silenceDurationMs
+int32
+
+Optional. The required duration of detected non-speech (e.g. silence) before end-of-speech is committed. The larger this value, the longer speech gaps can be without interrupting the user's activity but this will increase the model's latency.
+
+BidiGenerateContentClientContent
+Incremental update of the current conversation delivered from the client. All of the content here is unconditionally appended to the conversation history and used as part of the prompt to the model to generate content.
+
+A message here will interrupt any current model generation.
+
+Fields
+turns[]
+Content
+
+Optional. The content appended to the current conversation with the model.
+
+For single-turn queries, this is a single instance. For multi-turn queries, this is a repeated field that contains conversation history and the latest request.
+
+turnComplete
+bool
+
+Optional. If true, indicates that the server content generation should start with the currently accumulated prompt. Otherwise, the server awaits additional messages before starting generation.
+
+BidiGenerateContentRealtimeInput
+User input that is sent in real time.
+
+The different modalities (audio, video and text) are handled as concurrent streams. The ordering across these streams is not guaranteed.
+
+This is different from BidiGenerateContentClientContent in a few ways:
+
+Can be sent continuously without interruption to model generation.
+If there is a need to mix data interleaved across the BidiGenerateContentClientContent and the BidiGenerateContentRealtimeInput, the server attempts to optimize for best response, but there are no guarantees.
+End of turn is not explicitly specified, but is rather derived from user activity (for example, end of speech).
+Even before the end of turn, the data is processed incrementally to optimize for a fast start of the response from the model.
+Fields
+mediaChunks[]
+Blob
+
+Optional. Inlined bytes data for media input. Multiple mediaChunks are not supported, all but the first will be ignored.
+
+DEPRECATED: Use one of audio, video, or text instead.
+
+audio
+Blob
+
+Optional. These form the realtime audio input stream.
+
+video
+Blob
+
+Optional. These form the realtime video input stream.
+
+activityStart
+ActivityStart
+
+Optional. Marks the start of user activity. This can only be sent if automatic (i.e. server-side) activity detection is disabled.
+
+activityEnd
+ActivityEnd
+
+Optional. Marks the end of user activity. This can only be sent if automatic (i.e. server-side) activity detection is disabled.
+
+audioStreamEnd
+bool
+
+Optional. Indicates that the audio stream has ended, e.g. because the microphone was turned off.
+
+This should only be sent when automatic activity detection is enabled (which is the default).
+
+The client can reopen the stream by sending an audio message.
+
+text
+string
+
+Optional. These form the realtime text input stream.
+
+BidiGenerateContentServerContent
+Incremental server update generated by the model in response to client messages.
+
+Content is generated as quickly as possible, and not in real time. Clients may choose to buffer and play it out in real time.
+
+Fields
+generationComplete
+bool
+
+Output only. If true, indicates that the model is done generating.
+
+When model is interrupted while generating there will be no 'generation_complete' message in interrupted turn, it will go through 'interrupted > turn_complete'.
+
+When model assumes realtime playback there will be delay between generation_complete and turn_complete that is caused by model waiting for playback to finish.
+
+turnComplete
+bool
+
+Output only. If true, indicates that the model has completed its turn. Generation will only start in response to additional client messages.
+
+interrupted
+bool
+
+Output only. If true, indicates that a client message has interrupted current model generation. If the client is playing out the content in real time, this is a good signal to stop and empty the current playback queue.
+
+groundingMetadata
+GroundingMetadata
+
+Output only. Grounding metadata for the generated content.
+
+inputTranscription
+BidiGenerateContentTranscription
+
+Output only. Input audio transcription. The transcription is sent independently of the other server messages and there is no guaranteed ordering.
+
+outputTranscription
+BidiGenerateContentTranscription
+
+Output only. Output audio transcription. The transcription is sent independently of the other server messages and there is no guaranteed ordering, in particular not between serverContent and this outputTranscription.
+
+urlContextMetadata
+UrlContextMetadata
+
+modelTurn
+Content
+
+Output only. The content that the model has generated as part of the current conversation with the user.
+
+BidiGenerateContentServerMessage
+Response message for the BidiGenerateContent call.
+
+Fields
+usageMetadata
+UsageMetadata
+
+Output only. Usage metadata about the response(s).
+
+Union field messageType. The type of the message. messageType can be only one of the following:
+setupComplete
+BidiGenerateContentSetupComplete
+
+Output only. Sent in response to a BidiGenerateContentSetup message from the client when setup is complete.
+
+serverContent
+BidiGenerateContentServerContent
+
+Output only. Content generated by the model in response to client messages.
+
+toolCall
+BidiGenerateContentToolCall
+
+Output only. Request for the client to execute the functionCalls and return the responses with the matching ids.
+
+toolCallCancellation
+BidiGenerateContentToolCallCancellation
+
+Output only. Notification for the client that a previously issued ToolCallMessage with the specified ids should be cancelled.
+
+goAway
+GoAway
+
+Output only. A notice that the server will soon disconnect.
+
+sessionResumptionUpdate
+SessionResumptionUpdate
+
+Output only. Update of the session resumption state.
+
+BidiGenerateContentSetup
+Message to be sent in the first (and only in the first) BidiGenerateContentClientMessage. Contains configuration that will apply for the duration of the streaming RPC.
+
+Clients should wait for a BidiGenerateContentSetupComplete message before sending any additional messages.
+
+Fields
+model
+string
+
+Required. The model's resource name. This serves as an ID for the Model to use.
+
+Format: models/{model}
+
+generationConfig
+GenerationConfig
+
+Optional. Generation config.
+
+The following fields are not supported:
+
+responseLogprobs
+responseMimeType
+logprobs
+responseSchema
+stopSequence
+routingConfig
+audioTimestamp
+systemInstruction
+Content
+
+Optional. The user provided system instructions for the model.
+
+Note: Only text should be used in parts and content in each part will be in a separate paragraph.
+
+tools[]
+Tool
+
+Optional. A list of Tools the model may use to generate the next response.
+
+A Tool is a piece of code that enables the system to interact with external systems to perform an action, or set of actions, outside of knowledge and scope of the model.
+
+realtimeInputConfig
+RealtimeInputConfig
+
+Optional. Configures the handling of realtime input.
+
+sessionResumption
+SessionResumptionConfig
+
+Optional. Configures session resumption mechanism.
+
+If included, the server will send SessionResumptionUpdate messages.
+
+contextWindowCompression
+ContextWindowCompressionConfig
+
+Optional. Configures a context window compression mechanism.
+
+If included, the server will automatically reduce the size of the context when it exceeds the configured length.
+
+inputAudioTranscription
+AudioTranscriptionConfig
+
+Optional. If set, enables transcription of voice input. The transcription aligns with the input audio language, if configured.
+
+outputAudioTranscription
+AudioTranscriptionConfig
+
+Optional. If set, enables transcription of the model's audio output. The transcription aligns with the language code specified for the output audio, if configured.
+
+proactivity
+ProactivityConfig
+
+Optional. Configures the proactivity of the model.
+
+This allows the model to respond proactively to the input and to ignore irrelevant input.
+
+BidiGenerateContentSetupComplete
+This type has no fields.
+
+Sent in response to a BidiGenerateContentSetup message from the client.
+
+BidiGenerateContentToolCall
+Request for the client to execute the functionCalls and return the responses with the matching ids.
+
+Fields
+functionCalls[]
+FunctionCall
+
+Output only. The function call to be executed.
+
+BidiGenerateContentToolCallCancellation
+Notification for the client that a previously issued ToolCallMessage with the specified ids should not have been executed and should be cancelled. If there were side-effects to those tool calls, clients may attempt to undo the tool calls. This message occurs only in cases where the clients interrupt server turns.
+
+Fields
+ids[]
+string
+
+Output only. The ids of the tool calls to be cancelled.
+
+BidiGenerateContentToolResponse
+Client generated response to a ToolCall received from the server. Individual FunctionResponse objects are matched to the respective FunctionCall objects by the id field.
+
+Note that in the unary and server-streaming GenerateContent APIs function calling happens by exchanging the Content parts, while in the bidi GenerateContent APIs function calling happens over these dedicated set of messages.
+
+Fields
+functionResponses[]
+FunctionResponse
+
+Optional. The response to the function calls.
+
+BidiGenerateContentTranscription
+Transcription of audio (input or output).
+
+Fields
+text
+string
+
+Transcription text.
+
+ContextWindowCompressionConfig
+Enables context window compression — a mechanism for managing the model's context window so that it does not exceed a given length.
+
+Fields
+Union field compressionMechanism. The context window compression mechanism used. compressionMechanism can be only one of the following:
+slidingWindow
+SlidingWindow
+
+A sliding-window mechanism.
+
+triggerTokens
+int64
+
+The number of tokens (before running a turn) required to trigger a context window compression.
+
+This can be used to balance quality against latency as shorter context windows may result in faster model responses. However, any compression operation will cause a temporary latency increase, so they should not be triggered frequently.
+
+If not set, the default is 80% of the model's context window limit. This leaves 20% for the next user request/model response.
+
+EndSensitivity
+Determines how end of speech is detected.
+
+Enums
+END_SENSITIVITY_UNSPECIFIED	The default is END_SENSITIVITY_HIGH.
+END_SENSITIVITY_HIGH	Automatic detection ends speech more often.
+END_SENSITIVITY_LOW	Automatic detection ends speech less often.
+GoAway
+A notice that the server will soon disconnect.
+
+Fields
+timeLeft
+Duration
+
+The remaining time before the connection will be terminated as ABORTED.
+
+This duration will never be less than a model-specific minimum, which will be specified together with the rate limits for the model.
+
+ProactivityConfig
+Config for proactivity features.
+
+Fields
+proactiveAudio
+bool
+
+Optional. If enabled, the model can reject responding to the last prompt. For example, this allows the model to ignore out of context speech or to stay silent if the user did not make a request, yet.
+
+RealtimeInputConfig
+Configures the realtime input behavior in BidiGenerateContent.
+
+Fields
+automaticActivityDetection
+AutomaticActivityDetection
+
+Optional. If not set, automatic activity detection is enabled by default. If automatic voice detection is disabled, the client must send activity signals.
+
+activityHandling
+ActivityHandling
+
+Optional. Defines what effect activity has.
+
+turnCoverage
+TurnCoverage
+
+Optional. Defines which input is included in the user's turn.
+
+SessionResumptionConfig
+Session resumption configuration.
+
+This message is included in the session configuration as BidiGenerateContentSetup.sessionResumption. If configured, the server will send SessionResumptionUpdate messages.
+
+Fields
+handle
+string
+
+The handle of a previous session. If not present then a new session is created.
+
+Session handles come from SessionResumptionUpdate.token values in previous connections.
+
+SessionResumptionUpdate
+Update of the session resumption state.
+
+Only sent if BidiGenerateContentSetup.sessionResumption was set.
+
+Fields
+newHandle
+string
+
+New handle that represents a state that can be resumed. Empty if resumable=false.
+
+resumable
+bool
+
+True if the current session can be resumed at this point.
+
+Resumption is not possible at some points in the session. For example, when the model is executing function calls or generating. Resuming the session (using a previous session token) in such a state will result in some data loss. In these cases, newHandle will be empty and resumable will be false.
+
+SlidingWindow
+The SlidingWindow method operates by discarding content at the beginning of the context window. The resulting context will always begin at the start of a USER role turn. System instructions and any BidiGenerateContentSetup.prefixTurns will always remain at the beginning of the result.
+
+Fields
+targetTokens
+int64
+
+The target number of tokens to keep. The default value is trigger_tokens/2.
+
+Discarding parts of the context window causes a temporary latency increase so this value should be calibrated to avoid frequent compression operations.
+
+StartSensitivity
+Determines how start of speech is detected.
+
+Enums
+START_SENSITIVITY_UNSPECIFIED	The default is START_SENSITIVITY_HIGH.
+START_SENSITIVITY_HIGH	Automatic detection will detect the start of speech more often.
+START_SENSITIVITY_LOW	Automatic detection will detect the start of speech less often.
+TurnCoverage
+Options about which input is included in the user's turn.
+
+Enums
+TURN_COVERAGE_UNSPECIFIED	If unspecified, the default behavior is TURN_INCLUDES_ONLY_ACTIVITY.
+TURN_INCLUDES_ONLY_ACTIVITY	The users turn only includes activity since the last turn, excluding inactivity (e.g. silence on the audio stream). This is the default behavior.
+TURN_INCLUDES_ALL_INPUT	The users turn includes all realtime input since the last turn, including inactivity (e.g. silence on the audio stream).
+UrlContextMetadata
+Metadata related to url context retrieval tool.
+
+Fields
+urlMetadata[]
+UrlMetadata
+
+List of url context.
+
+UsageMetadata
+Usage metadata about response(s).
+
+Fields
+promptTokenCount
+int32
+
+Output only. Number of tokens in the prompt. When cachedContent is set, this is still the total effective prompt size meaning this includes the number of tokens in the cached content.
+
+cachedContentTokenCount
+int32
+
+Number of tokens in the cached part of the prompt (the cached content)
+
+responseTokenCount
+int32
+
+Output only. Total number of tokens across all the generated response candidates.
+
+toolUsePromptTokenCount
+int32
+
+Output only. Number of tokens present in tool-use prompt(s).
+
+thoughtsTokenCount
+int32
+
+Output only. Number of tokens of thoughts for thinking models.
+
+totalTokenCount
+int32
+
+Output only. Total token count for the generation request (prompt + response candidates).
+
+promptTokensDetails[]
+ModalityTokenCount
+
+Output only. List of modalities that were processed in the request input.
+
+cacheTokensDetails[]
+ModalityTokenCount
+
+Output only. List of modalities of the cached content in the request input.
+
+responseTokensDetails[]
+ModalityTokenCount
+
+Output only. List of modalities that were returned in the response.
+
+toolUsePromptTokensDetails[]
+ModalityTokenCount
+
+Output only. List of modalities that were processed for tool-use request inputs.
+
+Ephemeral authentication tokens
+Ephemeral authentication tokens can be obtained by calling AuthTokenService.CreateToken and then used with GenerativeService.BidiGenerateContentConstrained, either by passing the token in an access_token query parameter, or in an HTTP Authorization header with "Token" prefixed to it.
+
+CreateAuthTokenRequest
+Create an ephemeral authentication token.
+
+Fields
+authToken
+AuthToken
+
+Required. The token to create.
+
+AuthToken
+A request to create an ephemeral authentication token.
+
+Fields
+name
+string
+
+Output only. Identifier. The token itself.
+
+expireTime
+Timestamp
+
+Optional. Input only. Immutable. An optional time after which, when using the resulting token, messages in BidiGenerateContent sessions will be rejected. (Gemini may preemptively close the session after this time.)
+
+If not set then this defaults to 30 minutes in the future. If set, this value must be less than 20 hours in the future.
+
+newSessionExpireTime
+Timestamp
+
+Optional. Input only. Immutable. The time after which new Live API sessions using the token resulting from this request will be rejected.
+
+If not set this defaults to 60 seconds in the future. If set, this value must be less than 20 hours in the future.
+
+fieldMask
+FieldMask
+
+Optional. Input only. Immutable. If field_mask is empty, and bidiGenerateContentSetup is not present, then the effective BidiGenerateContentSetup message is taken from the Live API connection.
+
+If field_mask is empty, and bidiGenerateContentSetup is present, then the effective BidiGenerateContentSetup message is taken entirely from bidiGenerateContentSetup in this request. The setup message from the Live API connection is ignored.
+
+If field_mask is not empty, then the corresponding fields from bidiGenerateContentSetup will overwrite the fields from the setup message in the Live API connection.
+
+Union field config. The method-specific configuration for the resulting token. config can be only one of the following:
+bidiGenerateContentSetup
+BidiGenerateContentSetup
+
+Optional. Input only. Immutable. Configuration specific to BidiGenerateContent.
+
+uses
+int32
+
+Optional. Input only. Immutable. The number of times the token can be used. If this value is zero then no limit is applied. Resuming a Live API session does not count as a use. If unspecified, the default is 1.
+
+More information on common types
+
+For more information on the commonly-used API resource types Blob, Content, FunctionCall, FunctionResponse, GenerationConfig, GroundingMetadata, ModalityTokenCount, and Tool, see Generating content.
+
+
+
+================================================================
+End of Codebase
+================================================================
