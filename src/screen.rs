@@ -4,7 +4,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use xcap::{Frame, Monitor, VideoRecorder};
 
 /// Screen capture error that is Send + Sync
@@ -53,29 +53,32 @@ impl CapturedFrame {
 
     /// Convert the frame to JPEG format for sending to the Gemini API
     pub fn to_jpeg(&mut self) -> Result<&[u8], ScreenError> {
+        use tracing::{debug, info};
+        
         if self.jpeg_data.is_none() {
-            // Convert the raw RGBA buffer to JPEG
+            // Convert the raw RGBA buffer to JPEG using turbojpeg
             let width = self.frame.width;
             let height = self.frame.height;
+            
+            debug!("🔄 Converting {}x{} RGBA frame to JPEG using turbojpeg...", width, height);
 
-            // Create an RgbaImage from the raw data
-            let rgba_image = image::RgbaImage::from_raw(width, height, self.frame.raw.clone())
-                .ok_or_else(|| ScreenError::FrameConversionError("Failed to create image from raw data".to_string()))?;
+            let start = std::time::Instant::now();
+            
+            // Use turbojpeg for fast JPEG encoding
+            let jpeg_buffer = to_jpeg_fast(&self.frame.raw, width, height, 75)
+                .map_err(|e| ScreenError::FrameConversionError(format!("TurboJPEG error: {}", e)))?;
 
-            // First convert RGBA to RGB by dropping the alpha channel
-            let rgb_image = image::DynamicImage::ImageRgba8(rgba_image).into_rgb8();
-
-            // Encode as JPEG with reasonable quality
-            let mut jpeg_buffer = Vec::new();
-            let mut encoder =
-                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buffer, 75);
-            encoder.encode(&rgb_image, width, height, image::ExtendedColorType::Rgb8)
-                .map_err(|e| ScreenError::FrameConversionError(e.to_string()))?;
-
+            let encoding_time = start.elapsed();
+            let jpeg_size_kb = jpeg_buffer.len() / 1024;
+            info!("✅ TurboJPEG encoding complete: {} KB in {:.1}ms", jpeg_size_kb, encoding_time.as_secs_f64() * 1000.0);
             self.jpeg_data = Some(jpeg_buffer);
+        } else {
+            debug!("🔄 Using cached JPEG data");
         }
 
-        Ok(self.jpeg_data.as_ref().unwrap())
+        let jpeg_data = self.jpeg_data.as_ref().unwrap();
+        debug!("📤 Returning JPEG data: {} bytes", jpeg_data.len());
+        Ok(jpeg_data)
     }
 
     /// Returns the MIME type for the encoded image format
@@ -185,6 +188,9 @@ impl ScreenCapturer {
 
     /// Calculate a hash for a frame to use for deduplication
     fn calculate_frame_hash(frame: &Frame) -> u64 {
+        // random number for testing, not a real hash
+        return rand::random::<u64>();
+
         let mut hasher = DefaultHasher::new();
 
         // Create a smaller sampling of the frame for faster hashing
@@ -202,41 +208,51 @@ impl ScreenCapturer {
         frame.width.hash(&mut hasher);
         frame.height.hash(&mut hasher);
 
-        hasher.finish()
+        // hasher.finish()
+
     }
 
     /// Capture a single frame of the screen.
     /// This method respects the configured capture interval.
     pub fn capture_frame(&mut self) -> Result<CapturedFrame, ScreenError> {
+        use tracing::{debug, info};
         let now = std::time::Instant::now();
 
         // Check if we need to throttle frame captures
         if now.duration_since(self.last_capture) < self.capture_interval {
-            debug!("Capture interval not reached, throttling capture");
+            debug!("🚫 Frame capture throttled: interval not reached");
             return Err(ScreenError::Other("Capture interval not reached".to_string()));
         }
+        
+        debug!("📸 Starting screen capture...");
 
         // Try to receive a frame with timeout
         match self.frame_rx.recv_timeout(Duration::from_millis(800)) {
             // Increased timeout
             Ok(frame) => {
-                debug!("Captured frame: {}x{}", frame.width, frame.height);
+                info!("📸 Captured raw frame: {}x{} pixels", frame.width, frame.height);
 
                 // Calculate hash for deduplication
+                debug!("🔢 Calculating frame hash for deduplication...");
                 let frame_hash = Self::calculate_frame_hash(&frame);
 
                 // Check if it's a duplicate
                 if let Some(last_hash) = self.last_frame_hash {
                     if frame_hash == last_hash {
-                        warn!("Duplicate frame detected, skipping");
+                        debug!("🔄 Duplicate frame detected (hash: {}), skipping", frame_hash);
                         return Err(ScreenError::Other("Duplicate frame".to_string()));
+                    } else {
+                        debug!("✅ New unique frame detected (hash: {} -> {})", last_hash, frame_hash);
                     }
+                } else {
+                    debug!("✅ First frame captured (hash: {})", frame_hash);
                 }
 
                 // Update state
                 self.last_capture = now;
                 self.last_frame_hash = Some(frame_hash);
 
+                info!("✅ Screen capture successful, creating CapturedFrame");
                 Ok(CapturedFrame::new(frame))
             }
             Err(e) => {
@@ -313,4 +329,22 @@ pub fn quick_hash(frame: &Frame) -> u64 {
     frame.height.hash(&mut hasher);
 
     hasher.finish()
+}
+
+/// Fast JPEG encoding using libjpeg-turbo
+pub fn to_jpeg_fast(rgba: &[u8], width: u32, height: u32, quality: i32) -> turbojpeg::Result<Vec<u8>> {
+    use turbojpeg::{compress, Image, PixelFormat, Subsamp};
+
+    // libjpeg-turbo can accept 4-channel input; we just tell it RGBA
+    let img = Image {
+        pixels: rgba,
+        width: width as usize,
+        pitch: (width * 4) as usize, // bytes per scanline
+        height: height as usize,
+        format: PixelFormat::RGBA,
+    };
+
+    // Use 4:2:0 subsampling for good compression/quality balance
+    let compressed = compress(img, quality, Subsamp::Sub2x2)?;
+    Ok(compressed.as_ref().to_vec())
 }

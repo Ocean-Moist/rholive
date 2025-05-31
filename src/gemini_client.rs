@@ -584,14 +584,18 @@ impl GeminiClient {
             ClientMessage::RealtimeInput { realtime_input } => {
                 if realtime_input.audio.is_some() {
                     if realtime_input.audio_stream_end.unwrap_or(false) {
-                        info!("Sending end-of-audio signal to Gemini API");
+                        info!("📤 Sending end-of-audio signal to Gemini API");
                     } else {
-                        debug!("Sending audio chunk to Gemini API");
+                        info!("📤 Sending audio chunk to Gemini API");
                     }
                 } else if realtime_input.video.is_some() {
-                    debug!("Sending video frame to Gemini API");
+                    info!("📤 Sending video frame to Gemini API");
                 } else if realtime_input.text.is_some() {
-                    info!("Sending streaming text to Gemini API");
+                    info!("📤 Sending streaming text to Gemini API");
+                } else if realtime_input.activity_start.is_some() {
+                    info!("📤 Sending activityStart signal to Gemini API");
+                } else if realtime_input.activity_end.is_some() {
+                    info!("📤 Sending activityEnd signal to Gemini API");
                 }
             }
             ClientMessage::ToolResponse { .. } => info!("Sending tool response to Gemini API"),
@@ -694,6 +698,51 @@ impl GeminiClient {
             audio_stream_end: None,
         };
 
+        let msg = ClientMessage::RealtimeInput { realtime_input };
+        self.send(&msg).await
+    }
+    
+    /// Send a 20ms audio chunk for streaming (no activity flags)
+    pub async fn send_audio_chunk(&mut self, pcm_20ms: &[u8]) -> Result<()> {
+        let realtime_input = RealtimeInput {
+            audio: Some(RealtimeAudio {
+                data: general_purpose::STANDARD.encode(pcm_20ms),
+                mime_type: "audio/pcm;rate=16000".to_string(),
+            }),
+            video: None,
+            text: None,
+            activity_start: None,
+            activity_end: None,
+            audio_stream_end: None,
+        };
+        let msg = ClientMessage::RealtimeInput { realtime_input };
+        self.send(&msg).await
+    }
+    
+    /// Send activity start signal (no audio data)
+    pub async fn send_activity_start(&mut self) -> Result<()> {
+        let realtime_input = RealtimeInput {
+            audio: None,
+            video: None,
+            text: None,
+            activity_start: Some(serde_json::json!({})),
+            activity_end: None,
+            audio_stream_end: None,
+        };
+        let msg = ClientMessage::RealtimeInput { realtime_input };
+        self.send(&msg).await
+    }
+    
+    /// Send activity end signal (no audio data)
+    pub async fn send_activity_end(&mut self) -> Result<()> {
+        let realtime_input = RealtimeInput {
+            audio: None,
+            video: None,
+            text: None,
+            activity_start: None,
+            activity_end: Some(serde_json::json!({})),
+            audio_stream_end: None,
+        };
         let msg = ClientMessage::RealtimeInput { realtime_input };
         self.send(&msg).await
     }

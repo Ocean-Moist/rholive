@@ -14,8 +14,8 @@ mod broker;
 mod audio_capture;
 mod video_capture;
 mod gemini_ws;
-
-pub mod audio;
+mod gemini_ws_json;
+mod ws_writer;
 pub mod audio_async;
 pub mod audio_seg;
 mod gemini;
@@ -24,21 +24,23 @@ mod screen;
 pub mod ui;
 mod util;
 
-use crate::events::{InEvent, TurnInput, WsOut, WsIn};
+use crate::events::{InEvent, TurnInput, WsOut, WsIn, Outgoing};
 use crate::broker::{Broker, Event};
-use audio_seg::{AudioSegmenter, SegConfig, SegmentedTurn, i16_slice_to_u8};
+use audio_seg::{AudioSegmenter, SegConfig, i16_slice_to_u8};
 use ui::{launch_ui, AudioSample, ConversationEntry};
 
 use anyhow::Result;
-use std::collections::VecDeque;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     // Initialize logging with filters
     use tracing_subscriber::{EnvFilter, prelude::*};
-    
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -60,13 +62,22 @@ async fn main() -> Result<()> {
     let (tx_ws, rx_ws) = mpsc::unbounded_channel::<WsOut>();
     let (tx_evt, mut rx_evt) = mpsc::unbounded_channel::<WsIn>();
 
-    // Audio segmentation channel
+    // Audio segmentation channel (legacy)
     let (seg_tx, mut seg_rx) = mpsc::unbounded_channel::<TurnInput>();
+    
+    // NEW: Outgoing message channel for all producers
+    let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Outgoing>();
+    
+    // NEW: Channel for websocket writer to send JSON
+    let (ws_json_tx, mut ws_json_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    
+    // NEW: Global turn ID generator
+    let turn_id_generator = Arc::new(AtomicU64::new(0));
 
     // UI channels
     let (ui_audio_tx, mut ui_audio_rx) = mpsc::unbounded_channel::<AudioSample>();
     let (ui_conv_tx, mut ui_conv_rx) = mpsc::unbounded_channel::<ConversationEntry>();
-    
+
     // 2. Launch UI first
     info!("Starting UI...");
     let ui_state = launch_ui();
@@ -76,12 +87,25 @@ async fn main() -> Result<()> {
     let tx_in_for_audio = tx_in.clone();
     let tx_in_seg_for_audio = tx_in_seg.clone();
     audio_capture::spawn_with_dual_output(tx_in_for_audio, tx_in_seg_for_audio)?;
-    
+
     info!("Starting video capture...");
-    video_capture::spawn(tx_in.clone())?;
+    video_capture::spawn_with_outgoing(
+        tx_in.clone(),
+        outgoing_tx.clone(),
+        turn_id_generator.clone()
+    )?;
 
     // 4. Launch audio segmentation task in blocking thread
-    let seg_config = SegConfig::default();
+    let seg_config = SegConfig {
+        open_voiced_frames: 4,      // 80ms to open (responsive)
+        close_silence_ms: 250,      // 600ms silence to close (reasonable pauses)
+        max_turn_ms: 8000,          // 8 seconds max (good for demo)
+        min_clause_tokens: 10,       // 4 tokens for clause detection
+        asr_poll_ms: 400,           // Poll every 400ms
+        ring_capacity: 320_000,     // 20 seconds buffer
+        asr_pool_size: 2,           // 2 worker threads
+        asr_timeout_ms: 0,       // no timeout
+    };
     let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<i16>>();
     let ui_state_seg = ui_state.clone();
     let ui_conv_tx_seg = ui_conv_tx.clone();
@@ -98,8 +122,32 @@ async fn main() -> Result<()> {
     });
     
     // Run segmenter in blocking thread
+    let outgoing_tx_clone = outgoing_tx.clone();
+    let turn_id_gen_clone = turn_id_generator.clone();
     std::thread::spawn(move || {
         let mut segmenter = AudioSegmenter::new(seg_config, None).unwrap();
+        
+        // Set up the new outgoing channel
+        let (sync_outgoing_tx, sync_outgoing_rx) = std::sync::mpsc::channel();
+        segmenter.set_outgoing_sender(sync_outgoing_tx, turn_id_gen_clone);
+        
+        // Forward outgoing events to the async channel
+        std::thread::spawn(move || {
+            while let Ok(event) = sync_outgoing_rx.recv() {
+                let _ = outgoing_tx_clone.send(event);
+            }
+        });
+        
+        // Legacy streaming support (remove later)
+        let (stream_tx, stream_rx) = std::sync::mpsc::channel();
+        segmenter.set_streaming_sender(stream_tx);
+        
+        let seg_tx_clone = seg_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(event) = stream_rx.recv() {
+                let _ = seg_tx_clone.send(event);
+            }
+        });
         
         while let Ok(chunk) = audio_rx.recv() {
             // Calculate audio level for UI
@@ -148,13 +196,22 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 5. Launch Gemini websocket task
-    let api_key_clone = api_key.clone();
+    // 5. Launch WebSocket writer task
+    let (ws_evt_tx, ws_evt_rx) = mpsc::unbounded_channel::<WsIn>();
     tokio::spawn(async move {
-        if let Err(e) = gemini_ws::run(&api_key_clone, rx_ws, tx_evt).await {
+        ws_writer::run_writer(outgoing_rx, ws_json_tx, ws_evt_rx).await;
+    });
+    
+    // 6. Launch Gemini websocket task (using new JSON-based handler)
+    let api_key_clone = api_key.clone();
+    let tx_evt_for_gemini = tx_evt.clone();
+    tokio::spawn(async move {
+        if let Err(e) = gemini_ws_json::run(&api_key_clone, ws_json_rx, tx_evt_for_gemini).await {
             error!("Gemini WebSocket error: {}", e);
         }
     });
+    
+    // We'll forward events to the writer later in the main loop
 
     // Response handler
     let ui_conv_tx_clone = ui_conv_tx.clone();
@@ -219,9 +276,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 7. Run the broker FSM
-    info!("Starting turn broker...");
-    let mut broker = Broker::new();
+    // 7. Simple event forwarding loop (broker is now just for UI updates)
+    info!("Starting event forwarding loop...");
     let ui_state_broker = ui_state.clone();
     
     // Update UI connection status
@@ -231,44 +287,39 @@ async fn main() -> Result<()> {
     }
     
     loop {
-        let evt = tokio::select! {
-            // Handle speech turns from segmenter
+        tokio::select! {
+            // Legacy: Handle old-style speech turns from segmenter
             Some(turn) = seg_rx.recv() => {
-                let messages = broker.handle_speech_turn(turn);
-                
-                // Update frames sent counter
-                let frame_count = messages.iter().filter(|m| {
-                    if let WsOut::RealtimeInput(json) = m {
-                        json.get("video").is_some()
-                    } else {
-                        false
+                // For now, just log that we received it
+                // The real streaming is handled by the Outgoing channel
+                match turn {
+                    TurnInput::SpeechTurn { pcm, .. } => {
+                        info!("Received legacy SpeechTurn ({} KB)", pcm.len() / 1024);
                     }
-                }).count();
-                
-                if frame_count > 0 {
-                    if let Ok(mut state) = ui_state_broker.lock() {
-                        state.frames_sent += frame_count as u32;
+                    TurnInput::StreamingAudio { .. } => {
+                        debug!("Received legacy StreamingAudio event");
                     }
+                    _ => {}
                 }
-                
-                for msg in messages {
-                    tx_ws.send(msg)?;
-                }
-                continue;
             }
-            // Handle input events
-            Some(e) = rx_in.recv() => Event::Input(e),
             // Handle WebSocket events  
             Some(e) = rx_evt.recv() => {
-                let _ = evt_broadcast_tx.send(e.clone());
-                Event::Ws(e)
+                match &e {
+                    WsIn::GenerationComplete => {
+                        info!("✅ Received GenerationComplete");
+                        // Forward to writer for latency tracking
+                        let _ = ws_evt_tx.send(e.clone());
+                    }
+                    WsIn::Text { content, .. } => {
+                        debug!("📥 Received text response: {}", content.chars().take(50).collect::<String>());
+                    }
+                    _ => {}
+                }
+                // Broadcast to UI handler
+                let _ = evt_broadcast_tx.send(e);
             }
             // Exit if all channels closed
             else => break,
-        };
-        
-        for msg in broker.handle(evt) {
-            tx_ws.send(msg)?;
         }
     }
 

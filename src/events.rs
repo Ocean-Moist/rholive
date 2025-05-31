@@ -7,6 +7,15 @@ pub enum InEvent {
     UniqueFrame { jpeg: Vec<u8>, hash: u64 },
 }
 
+/// Messages sent from producers (audio/video) to the websocket writer
+#[derive(Debug, Clone)]
+pub enum Outgoing {
+    ActivityStart(u64),           // turn-id
+    AudioChunk(Vec<u8>, u64),     // data, turn-id
+    VideoFrame(Vec<u8>, u64),     // jpeg data, turn-id  
+    ActivityEnd(u64),             // turn-id
+}
+
 #[derive(Debug, Clone)]
 pub enum TurnInput {
     SpeechTurn {
@@ -17,6 +26,11 @@ pub enum TurnInput {
     VideoTurn {
         frames: SmallVec<[FrameId; 8]>,
         t_start: Instant,
+    },
+    StreamingAudio {
+        bytes: Vec<u8>,
+        is_start: bool,
+        is_end: bool,
     },
 }
 

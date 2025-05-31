@@ -32,7 +32,7 @@ pub struct AsyncAudioCapturer {
 impl AsyncAudioCapturer {
     /// Create a new async audio capturer
     pub fn new(app_name: &str, device_name: Option<&str>) -> Result<Self, Box<dyn Error>> {
-        let (tx, rx) = mpsc::channel::<Vec<i16>>(32);
+        let (tx, rx) = mpsc::channel::<Vec<i16>>(128);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         
@@ -53,7 +53,7 @@ impl AsyncAudioCapturer {
         })
     }
     
-    /// Read the next chunk of audio data (100ms worth)
+    /// Read the next chunk of audio data (20ms worth)
     /// Returns None if the capture has ended
     pub async fn read_chunk(&mut self) -> Option<Vec<i16>> {
         self.rx.recv().await
@@ -162,7 +162,7 @@ fn run_audio_capture(
     ));
     
     // Buffer for accumulating samples
-    let buffer = Rc::new(RefCell::new(Vec::<i16>::with_capacity(1600)));
+    let buffer = Rc::new(RefCell::new(Vec::<i16>::with_capacity(320)));
     
     // Set up the read callback
     let tx_clone = tx.clone();
@@ -204,9 +204,9 @@ fn run_audio_capture(
                         let buffer = &mut *buffer_ref.as_ptr();
                         buffer.extend_from_slice(&samples);
                         
-                        // Send complete 100ms chunks (1600 samples)
-                        while buffer.len() >= 1600 {
-                            let chunk: Vec<i16> = buffer.drain(..1600).collect();
+                        // Send complete 20ms chunks (320 samples)
+                        while buffer.len() >= 320 {
+                            let chunk: Vec<i16> = buffer.drain(..320).collect();
                             // Use blocking send since we're in a thread
                             if tx_clone.blocking_send(chunk).is_err() {
                                 // Receiver dropped, initiate shutdown
@@ -273,7 +273,7 @@ fn run_audio_capture(
         tlength: std::u32::MAX,
         prebuf: std::u32::MAX,
         minreq: std::u32::MAX,
-        fragsize: 3200, // 100ms chunks (1600 samples * 2 bytes)
+        fragsize: 640, // 20ms chunks (320 samples * 2 bytes)
     };
     
     // Connect the stream for recording

@@ -45,6 +45,7 @@ futures-util = "0.3"
 base64 = "0.22.1"
 thiserror = "2.0.12"
 image = { version = "0.25.6", features = ["jpeg"] }
+turbojpeg = "1.0"
 egui_window_glfw_passthrough = "0.9.0"
 egui_glow = "0.29.1" # Add egui_glow for rendering
 egui = "0.29.1"
@@ -55,5 +56,6 @@ smallvec = "1"
 # Audio segmentation dependencies
 webrtc-vad = "0.4.0"
 whisper-rs = "0.14.2"  # Using default features - intel-mkl feature not available
-hound = "3.5.1"  # For WAV handling in tests
+hound = "3.5.1"
+rand = "0.9.1"  # For WAV handling in tests
 

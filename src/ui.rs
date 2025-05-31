@@ -55,6 +55,9 @@ pub struct UiState {
     /// Typewriter animation state
     pub typewriter_position: usize,
     pub typewriter_last_update: Instant,
+    /// Latency tracking
+    pub pending_turns_count: usize,
+    pub avg_latency_ms: f32,
 }
 
 pub struct UiApp {
@@ -88,6 +91,8 @@ impl UiApp {
             last_activity: Instant::now(),
             typewriter_position: 0,
             typewriter_last_update: Instant::now(),
+            pending_turns_count: 0,
+            avg_latency_ms: 0.0,
         };
         
         // Initialize with some flat audio samples
@@ -481,12 +486,16 @@ impl UiApp {
                                         // Stats (minimal)
                                         if state_guard.show_debug {
                                             ui.label(
-                                                RichText::new(format!("Segments: {} | Frames: {} | FPS: {:.0}", 
-                                                    state_guard.segments_processed, 
+                                                RichText::new(format!(
+                                                    "Segments: {} | Frames Sent: {} | FPS: {:.0} | Pending Turns: {} | Avg Latency: {:.0}ms",
+                                                    state_guard.segments_processed,
                                                     state_guard.frames_sent,
-                                                    fps))
-                                                    .size(11.0)
-                                                    .color(Color32::from_gray(120))
+                                                    fps,
+                                                    state_guard.pending_turns_count,
+                                                    state_guard.avg_latency_ms
+                                                ))
+                                                .size(11.0)
+                                                .color(Color32::from_gray(120))
                                             );
                                         }
                                     });

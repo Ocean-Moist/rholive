@@ -42,8 +42,8 @@ async fn capture_loop(tx: UnboundedSender<InEvent>) -> Result<()> {
         None,
     )?;
 
-    let mut ticker = interval(Duration::from_millis(100));
-    let samples_per_chunk = 1600;
+    let mut ticker = interval(Duration::from_millis(20));
+    let samples_per_chunk = 320;
 
     loop {
         ticker.tick().await;
@@ -90,8 +90,8 @@ async fn capture_loop_dual(tx1: UnboundedSender<InEvent>, tx2: UnboundedSender<I
         None,
     )?;
 
-    let mut ticker = interval(Duration::from_millis(100));
-    let samples_per_chunk = 1600;
+    let mut ticker = interval(Duration::from_millis(20));
+    let samples_per_chunk = 320;
 
     loop {
         ticker.tick().await;

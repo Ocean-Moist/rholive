@@ -8,12 +8,13 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 use webrtc_vad::{SampleRate, Vad, VadMode};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use crate::events::{TurnInput, Outgoing};
 
 /// Reason why a segment was closed
 #[derive(Debug, Clone, PartialEq)]
@@ -390,6 +391,10 @@ impl BoundaryFSM {
             BoundaryState::Idle => None,
         }
     }
+    
+    pub fn get_state(&self) -> &BoundaryState {
+        &self.state
+    }
 }
 
 /// Request to ASR worker pool
@@ -709,6 +714,16 @@ pub struct AudioSegmenter {
     next_asr_id: u64,
     /// Track the last index submitted to ASR to avoid duplicate processing
     last_asr_submit_idx: Option<usize>,
+    /// Track the previous FSM state to detect transitions
+    prev_fsm_state: Option<BoundaryState>,
+    /// Sender for streaming events
+    streaming_tx: Option<mpsc::Sender<TurnInput>>,
+    /// Sender for outgoing websocket messages
+    outgoing_tx: Option<mpsc::Sender<Outgoing>>,
+    /// Global turn ID generator (shared across all producers)
+    turn_id_generator: Arc<AtomicU64>,
+    /// Current turn ID for this segmenter
+    current_turn_id: Option<u64>,
 }
 
 impl AudioSegmenter {
@@ -739,26 +754,40 @@ impl AudioSegmenter {
             last_asr_poll: Instant::now(),
             next_asr_id: 1,
             last_asr_submit_idx: None,
+            prev_fsm_state: None,
+            streaming_tx: None,
+            outgoing_tx: None,
+            turn_id_generator: Arc::new(AtomicU64::new(0)),
+            current_turn_id: None,
         })
     }
 
-    /// Process a 100ms chunk (1600 samples at 16kHz)
+    /// Set the streaming event sender
+    pub fn set_streaming_sender(&mut self, tx: mpsc::Sender<TurnInput>) {
+        self.streaming_tx = Some(tx);
+    }
+    
+    /// Set the outgoing websocket message sender and turn ID generator
+    pub fn set_outgoing_sender(&mut self, tx: mpsc::Sender<Outgoing>, turn_id_gen: Arc<AtomicU64>) {
+        self.outgoing_tx = Some(tx);
+        self.turn_id_generator = turn_id_gen;
+    }
+
+    /// Process a 20ms chunk (320 samples at 16kHz)
     pub fn push_chunk(&mut self, chunk: &[i16]) -> Option<SegmentedTurn> {
-        if chunk.len() != 1600 {
-            warn!("Expected 1600 samples, got {}", chunk.len());
+        if chunk.len() != 320 {
+            warn!("Expected 320 samples, got {}", chunk.len());
             return None;
         }
 
         let timestamp = Instant::now();
         let chunk_start_idx = self.ring_buffer.push_frame(chunk);
         
-        // Process 5 sub-frames of 20ms each for VAD
-        for (i, sub_frame) in chunk.chunks(320).enumerate() {
-            if sub_frame.len() == 320 {
-                let sub_frame_idx = chunk_start_idx + (i * 320);
-                let _ = self.frame_classifier.classify_frame(sub_frame, sub_frame_idx, timestamp);
-            }
-        }
+        // Store current FSM state before processing
+        let prev_state = self.prev_fsm_state.clone();
+        
+        // Process the 20ms frame directly for VAD
+        let _ = self.frame_classifier.classify_frame(chunk, chunk_start_idx, timestamp);
         
         // Process frame events
         while let Ok(frame_meta) = self.frame_receiver.try_recv() {
@@ -766,10 +795,70 @@ impl AudioSegmenter {
             self.boundary_fsm.process_frame(&frame_meta, current_global_idx);
         }
         
+        // Check for state transitions and emit outgoing events
+        let current_state = self.boundary_fsm.get_state();
+        
+        // Use new outgoing channel if available, otherwise fall back to streaming
+        if let Some(ref tx) = self.outgoing_tx {
+            // Check if we just opened a segment (Idle -> Recording)
+            if matches!(prev_state, Some(BoundaryState::Idle) | None) && 
+               matches!(current_state, BoundaryState::Recording { .. }) {
+                // Generate new turn ID
+                let turn_id = self.turn_id_generator.fetch_add(1, Ordering::SeqCst);
+                self.current_turn_id = Some(turn_id);
+                let _ = tx.send(Outgoing::ActivityStart(turn_id));
+            }
+            
+            // Always send the audio chunk if we're recording
+            if let Some(turn_id) = self.current_turn_id {
+                if matches!(current_state, BoundaryState::Recording { .. } | BoundaryState::Committing { .. }) {
+                    let pcm_bytes = i16_slice_to_u8(chunk);
+                    let _ = tx.send(Outgoing::AudioChunk(pcm_bytes.to_vec(), turn_id));
+                }
+            }
+        } else if let Some(ref tx) = self.streaming_tx {
+            // Fallback to old streaming system
+            if matches!(prev_state, Some(BoundaryState::Idle) | None) && 
+               matches!(current_state, BoundaryState::Recording { .. }) {
+                let _ = tx.send(TurnInput::StreamingAudio {
+                    bytes: vec![],
+                    is_start: true,
+                    is_end: false,
+                });
+            }
+            
+            if matches!(current_state, BoundaryState::Recording { .. } | BoundaryState::Committing { .. }) {
+                let pcm_bytes = i16_slice_to_u8(chunk);
+                let _ = tx.send(TurnInput::StreamingAudio {
+                    bytes: pcm_bytes.to_vec(),
+                    is_start: false,
+                    is_end: false,
+                });
+            }
+        }
+        
+        // Update previous state
+        self.prev_fsm_state = Some(current_state.clone());
+        
         // Process boundary events
         while let Ok(boundary_event) = self.boundary_receiver.try_recv() {
             let seg_id = self.next_asr_id;
             self.next_asr_id += 1;
+            
+            // Emit end event when segment closes
+            if let Some(ref tx) = self.outgoing_tx {
+                if let Some(turn_id) = self.current_turn_id {
+                    let _ = tx.send(Outgoing::ActivityEnd(turn_id));
+                }
+                self.current_turn_id = None;
+            } else if let Some(ref tx) = self.streaming_tx {
+                let _ = tx.send(TurnInput::StreamingAudio {
+                    bytes: vec![],
+                    is_start: false,
+                    is_end: true,
+                });
+            }
+            
             self.emitter.process_boundary_event(boundary_event, seg_id);
         }
         

@@ -1,6 +1,6 @@
 use crate::events::{WsOut, WsIn};
 use crate::gemini_client::GeminiClient;
-use crate::gemini::{ApiResponse, ServerMessage};
+use crate::gemini::ApiResponse;
 use anyhow::Result;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -14,9 +14,7 @@ pub async fn run(
     let mut config = GeminiClientConfig::default();
     config.system_instruction = Some(
         "\
-        you are a silent helper meant to assist the user in whatever task they choose. if you see a leetcode problem on the screen, solve it without waiting for them to say anything. if someone they are on call with asks you a question, answer it. you are effectively their second mind, they should not have to do any thinking, they should not have to ask you for anything. you are their brain, they should not have to think, respond to whatever is on screen or whatever someone says like the user would.
-
-            when there is no change or nothing to work, do, or comment on, respond only with '<nothing>' (without quotes).
+            describe what you see on the screen, if it hasn't changed, respond with '<nothing>' (no quotes). ignore audio. do not repeat yourself.
         \
         ".to_string()
     );
@@ -30,8 +28,10 @@ pub async fn run(
     
     tokio::spawn(async move {
         while let Some(msg) = rx_ws.recv().await {
+            use tracing::info;
+            info!("📨 Received WsOut message for transmission to Gemini");
             if let Err(e) = handle_outgoing(&mut client, msg).await {
-                eprintln!("Error sending to Gemini: {}", e);
+                tracing::error!("❌ Error sending to Gemini: {}", e);
             }
         }
     });
@@ -53,39 +53,70 @@ pub async fn run(
 }
 
 async fn handle_outgoing(client: &mut GeminiClient, msg: WsOut) -> Result<()> {
+    use tracing::{debug, info};
+    
     match msg {
         WsOut::Setup(_json) => {
+            debug!("🔧 Handling Setup message (skipped)");
             Ok(())
         }
         WsOut::RealtimeInput(json) => {
+            if json.get("video").is_some() {
+                info!("📹 Sending video frame to Gemini client");
+            } else if json.get("audio").is_some() {
+                info!("🎵 Sending audio chunk to Gemini client");
+            } else if json.get("activityStart").is_some() {
+                info!("🎬 Sending activityStart to Gemini client");
+            } else if json.get("activityEnd").is_some() {
+                info!("🎬 Sending activityEnd to Gemini client");
+            } else {
+                info!("📨 Sending other realtime input to Gemini client");
+            }
             client.send_realtime_input(json).await?;
+            debug!("✅ Realtime input sent successfully");
             Ok(())
         }
         WsOut::ClientContent(json) => {
+            info!("💬 Sending client content to Gemini client");
             client.send_client_content(json).await?;
+            debug!("✅ Client content sent successfully");
             Ok(())
         }
     }
 }
 
 fn handle_incoming(resp: ApiResponse, tx: &UnboundedSender<WsIn>) -> Result<()> {
+    use tracing::info;
+    
     match resp {
         ApiResponse::TextResponse { text, is_complete } => {
+            if is_complete {
+                info!("📥 Received complete text response from Gemini: {}", text.chars().take(100).collect::<String>());
+            } else {
+                info!("📥 Received partial text response from Gemini: {}", text.chars().take(50).collect::<String>());
+            }
             tx.send(WsIn::Text {
                 content: text,
                 is_final: is_complete,
             })?;
             if is_complete {
+                info!("✅ Gemini generation complete");
                 tx.send(WsIn::GenerationComplete)?;
             }
         }
         ApiResponse::OutputTranscription(transcript) => {
+            info!("📥 Received output transcription from Gemini: {}", transcript.text);
             tx.send(WsIn::Text {
                 content: transcript.text,
                 is_final: transcript.is_final,
             })?;
         }
         ApiResponse::ConnectionClosed | ApiResponse::GoAway => {
+            info!("📥 Gemini connection closing");
+            tx.send(WsIn::GenerationComplete)?;
+        }
+        ApiResponse::GenerationComplete => {
+            info!("✅ Forwarding GenerationComplete to broker");
             tx.send(WsIn::GenerationComplete)?;
         }
         _ => {}
