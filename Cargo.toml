@@ -3,35 +3,16 @@ name = "rholive"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-name = "rholive"
-path = "src/main.rs"
-
 [[bin]]
 name = "rholive"
 path = "src/main.rs"
-
-[[bin]]
-name = "segment_demo"
-path = "src/bin/audio_test.rs"
-
-[[bin]]
-name = "audio_device_test"
-path = "src/bin/audio_device_test.rs"
-
-[[bin]]
-name = "test_wav"
-path = "src/bin/test_wav.rs"
-
-[[bin]]
-name = "test_async_audio"
-path = "src/bin/test_async_audio.rs"
 
 
 
 
 [dependencies]
 anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
 xcap = { version = "0.6.0", features = ["image"] }
 libpulse-simple-binding = "2.28"
 libpulse-binding = "2.30"
@@ -44,6 +25,7 @@ serde_json = "1.0"
 futures-util = "0.3"
 base64 = "0.22.1"
 thiserror = "2.0.12"
+chrono = "0.4"
 image = { version = "0.25.6", features = ["jpeg"] }
 turbojpeg = "1.0"
 egui_window_glfw_passthrough = "0.9.0"
@@ -58,4 +40,5 @@ webrtc-vad = "0.4.0"
 whisper-rs = "0.14.2"  # Using default features - intel-mkl feature not available
 hound = "3.5.1"
 rand = "0.9.1"  # For WAV handling in tests
+rtrb = "0.3"  # Lock-free ring buffer for audio
 

@@ -469,10 +469,10 @@ impl GeminiClient {
             }),
         );
 
-        // Set activity handling for responsive interruptions
+        // Set activity handling to NO_INTERRUPTION for natural batching
         config_map.insert(
             "activityHandling".to_string(),
-            serde_json::json!("START_OF_ACTIVITY_INTERRUPTS"),
+            serde_json::json!("NO_INTERRUPTION"),
         );
 
         // Set turnCoverage to include all input (not just within activity markers)

@@ -188,9 +188,6 @@ impl ScreenCapturer {
 
     /// Calculate a hash for a frame to use for deduplication
     fn calculate_frame_hash(frame: &Frame) -> u64 {
-        // random number for testing, not a real hash
-        return rand::random::<u64>();
-
         let mut hasher = DefaultHasher::new();
 
         // Create a smaller sampling of the frame for faster hashing
@@ -208,7 +205,7 @@ impl ScreenCapturer {
         frame.width.hash(&mut hasher);
         frame.height.hash(&mut hasher);
 
-        // hasher.finish()
+        hasher.finish()
 
     }
 
@@ -229,7 +226,11 @@ impl ScreenCapturer {
         // Try to receive a frame with timeout
         match self.frame_rx.recv_timeout(Duration::from_millis(800)) {
             // Increased timeout
-            Ok(frame) => {
+            Ok(mut frame) => {
+                // Drain the channel to get the newest frame
+                while let Ok(f) = self.frame_rx.try_recv() {
+                    frame = f;
+                }
                 info!("📸 Captured raw frame: {}x{} pixels", frame.width, frame.height);
 
                 // Calculate hash for deduplication
@@ -276,7 +277,11 @@ impl ScreenCapturer {
 
         // For forced captures, we'll still capture even if it's a duplicate
         match self.frame_rx.recv_timeout(Duration::from_millis(800)) {
-            Ok(frame) => {
+            Ok(mut frame) => {
+                // Drain the channel to get the newest frame
+                while let Ok(f) = self.frame_rx.try_recv() {
+                    frame = f;
+                }
                 debug!("Forced capture of frame: {}x{}", frame.width, frame.height);
 
                 // Calculate hash for future comparison

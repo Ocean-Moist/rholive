@@ -19,6 +19,7 @@ pub struct ConversationEntry {
     pub role: String, // "User" or "Gemini"
     pub text: String,
     pub timestamp: Instant,
+    pub is_streaming: bool, // Whether this entry is still being updated
 }
 
 pub struct UiState {
@@ -50,7 +51,7 @@ pub struct UiState {
     pub status_message: String,
     /// UI collapsed state
     pub is_collapsed: bool,
-    /// Last activity time for auto-collapse
+    /// Last activity time
     pub last_activity: Instant,
     /// Typewriter animation state
     pub typewriter_position: usize,
@@ -265,13 +266,6 @@ impl UiApp {
                 }
             }
 
-            // Check for auto-collapse (30 seconds of inactivity)
-            {
-                let mut state_guard = state.lock().unwrap();
-                if !state_guard.is_collapsed && state_guard.last_activity.elapsed() > Duration::from_secs(30) {
-                    state_guard.is_collapsed = true;
-                }
-            }
 
             // Animate height changes
             let is_collapsed = state.lock().unwrap().is_collapsed;
